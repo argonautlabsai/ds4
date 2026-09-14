@@ -1,0 +1,161 @@
+{
+  "status": "not_ready_for_final_16_3_claim",
+  "source_branch": "argonaut-v41-benchmark",
+  "validated_source_commit": "aa20dd6",
+  "model_sha256": "a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e",
+  "all_three_model_copies_sha256_verified": true,
+  "toolchain": "Apple clang 21.0.0; macOS 26.5 SDK",
+  "hardware": "Apple M5 Max, 128 GiB, internal + two SSD enclosures",
+  "reproducibility_gate": "PASS: fresh GitHub clone builds and executes actual three-source reader; private provider not required. Exact historical speed not reproduced.",
+  "quality_gate": "PASS within bounded scope: four server responses byte-identical to freshly rebuilt upstream; malformed request rejected and subsequent request recovered; GCD 49 pairs passed. General quality not established.",
+  "first_token_gate": "MEASURED: client-observed first nonempty content on loaded server, includes each request prefill. Separate from raw pp512 benchmark and process startup.",
+  "physical_byte_gate": "OPEN: application counters close but physical-minus-application residual remains unassigned.",
+  "fresh_arms": {
+    "fresh-off": {
+      "prompt_tokens": 512,
+      "generated_tokens": 128,
+      "generation_tok_s": 13.9,
+      "steady_tok_s": 15.32,
+      "first_decode_step_ms": 914.902,
+      "output_sha256": "fd7e56288bd077741b2b575ab2c7bfe01fa60375b31f9d7c266a98558d7ffacd"
+    },
+    "fresh-accounting": {
+      "prompt_tokens": 512,
+      "generated_tokens": 128,
+      "generation_tok_s": 13.81,
+      "steady_tok_s": 15.19,
+      "first_decode_step_ms": 905.975,
+      "output_sha256": "fd7e56288bd077741b2b575ab2c7bfe01fa60375b31f9d7c266a98558d7ffacd"
+    },
+    "xcode21-off": {
+      "prompt_tokens": 512,
+      "generated_tokens": 128,
+      "generation_tok_s": 14.0,
+      "steady_tok_s": 15.45,
+      "first_decode_step_ms": 920.917,
+      "output_sha256": "f371029f8a7d07cf035cd3bdfd7aff736e4daf4224f6607d73968a22210866f8"
+    },
+    "xcode21-accounting": {
+      "prompt_tokens": 512,
+      "generated_tokens": 128,
+      "generation_tok_s": 13.95,
+      "steady_tok_s": 15.48,
+      "first_decode_step_ms": 966.09,
+      "output_sha256": "f371029f8a7d07cf035cd3bdfd7aff736e4daf4224f6607d73968a22210866f8"
+    }
+  },
+  "clang14_arms": "Diagnostic only: wrong toolchain for historical comparison; generated text differs. Do not mix with clang21 results.",
+  "client_ttft_seconds": {
+    "code": {
+      "upstream": 11.112218083995685,
+      "fork": 8.020891125001071
+    },
+    "prose": {
+      "upstream": 12.02747499999532,
+      "fork": 6.918582999998762
+    },
+    "reasoning": {
+      "upstream": 7.80365154100582,
+      "fork": 4.542640291998396
+    },
+    "reasoning-repeat": {
+      "upstream": 7.432225624994317,
+      "fork": 4.243622708003386
+    }
+  },
+  "accounting_comparison_percent": -0.357142857142867,
+  "accounting_overhead_scope": "One matched pair; observed difference is not a statistical overhead bound.",
+  "bytes": {
+    "application_counter_closure": true,
+    "physical_attribution_complete": false,
+    "phases": {
+      "prefill": {
+        "seconds": 32.97071999999753,
+        "drives": {
+          "internal": {
+            "routed_reader_bytes": 0,
+            "engram_read_bytes": 6352368,
+            "instrumented_application_bytes": 6352368,
+            "physical_read_bytes_estimate": 314873888399.78906,
+            "physical_minus_instrumented_bytes": 314867536031.78906,
+            "physical_read_bytes_bounds": [
+              314866208768.0,
+              314878451712.0
+            ]
+          },
+          "enclosure1": {
+            "routed_reader_bytes": 0,
+            "engram_read_bytes": 0,
+            "instrumented_application_bytes": 0,
+            "physical_read_bytes_estimate": 3037158.328857422,
+            "physical_minus_instrumented_bytes": 3037158.328857422,
+            "physical_read_bytes_bounds": [
+              0.0,
+              4718592.0
+            ]
+          },
+          "enclosure2": {
+            "routed_reader_bytes": 0,
+            "engram_read_bytes": 0,
+            "instrumented_application_bytes": 0,
+            "physical_read_bytes_estimate": 3037158.328857422,
+            "physical_minus_instrumented_bytes": 3037158.328857422,
+            "physical_read_bytes_bounds": [
+              0.0,
+              4718592.0
+            ]
+          }
+        },
+        "scope": "Matched phase window; routed reader and Engram successful pread bytes only. Excludes mmap/prefill loads, cache hits, metadata and unrelated processes. Physical-minus-instrumented residual is unassigned."
+      },
+      "decode": {
+        "seconds": 9.17641200000071,
+        "drives": {
+          "internal": {
+            "routed_reader_bytes": 23158259712,
+            "engram_read_bytes": 1622016,
+            "instrumented_application_bytes": 23159881728,
+            "physical_read_bytes_estimate": 20514277688.76758,
+            "physical_minus_instrumented_bytes": -2645604039.232422,
+            "physical_read_bytes_bounds": [
+              20473880576.0,
+              20581912576.0
+            ]
+          },
+          "enclosure1": {
+            "routed_reader_bytes": 10437525504,
+            "engram_read_bytes": 0,
+            "instrumented_application_bytes": 10437525504,
+            "physical_read_bytes_estimate": 10402126945.259766,
+            "physical_minus_instrumented_bytes": -35398558.740234375,
+            "physical_read_bytes_bounds": [
+              10380902400.0,
+              10437525504.0
+            ]
+          },
+          "enclosure2": {
+            "routed_reader_bytes": 10437525504,
+            "engram_read_bytes": 0,
+            "instrumented_application_bytes": 10437525504,
+            "physical_read_bytes_estimate": 10402126945.259766,
+            "physical_minus_instrumented_bytes": -35398558.740234375,
+            "physical_read_bytes_bounds": [
+              10380902400.0,
+              10437525504.0
+            ]
+          }
+        },
+        "scope": "Matched phase window; routed reader and Engram successful pread bytes only. Excludes mmap/prefill loads, cache hits, metadata and unrelated processes. Physical-minus-instrumented residual is unassigned."
+      }
+    },
+    "prefill_to_first_token_selection_seconds": 32.97298099999898,
+    "timing_scope": "Loaded benchmark, prompt sync to first argmax selection; excludes HTTP and model startup.",
+    "physical_gate": "Residuals measured, causes unestablished; do not claim exact physical attribution."
+  },
+  "tests": {
+    "python_harness": 13,
+    "reader_fixtures": "3 passed under ASan and UBSan with clang21",
+    "clang14_asan": "Runtime initialization aborted before fixture main; not a reader pass."
+  },
+  "publication_ready": false
+}

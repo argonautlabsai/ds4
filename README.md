@@ -24,7 +24,7 @@ The reader is implemented in `argodrive_read.h`: complete identical GGUF replica
 
 **16.31 tok/s is a historical steady-decode maximum at pp512/tg128, excluding the first decode step. The same arm was 14.70 tok/s including that step.** It is not a guaranteed result or a final publication claim. The three historical pp512/tg512 runs were 15.49–15.56 tok/s including the first step. See [the metric table](argodrive/results/frozen-summary.json).
 
-Fresh-clone execution, quality regression, client-observed first-token timing and phase-aligned byte accounting are being qualified. Results use one raw completion prompt; task quality and chat timing are separate. See [credits](CREDITS.md) for attribution. CUDA and distributed execution of these additions are unqualified.
+Fresh-clone execution and bounded upstream output comparisons passed with clang21/macOS26.5. Client first-content times are captured. Application counters close, but physical byte attribution still has an unexplained residual. [Current validation and open gates](argodrive/results/VALIDATION-2026-09-14.md) record 14.00 tok/s inclusive / 15.45 steady from the fresh accounting-off arm. Results use one raw completion prompt; task quality and chat timing are separate. See [credits](CREDITS.md) for attribution. CUDA and distributed execution of these additions are unqualified.
 
 ---
 
