@@ -39685,6 +39685,23 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    /* Exact router IDs are available now. Begin their reads before encoding
+     * shared-expert work, using the existing bounded loader and ownership rules.
+     * The routed operation consumes the matching prefetched IDs and joins reads. */
+    if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix &&
+        getenv("DS4_ARGODRIVE_EARLY_EXPERTS") != NULL) {
+        const ds4_gpu_stream_expert_table table = {
+            .model_map=m->map, .model_size=m->size, .layer=il,
+            .n_total_expert=DS4_N_EXPERT,
+            .gate_offset=l->ffn_gate_exps->abs_offset,
+            .up_offset=l->ffn_up_exps->abs_offset,
+            .down_offset=l->ffn_down_exps->abs_offset,
+            .gate_expert_bytes=gate_row * DS4_N_FF_EXP,
+            .down_expert_bytes=down_row * DS4_N_EMBD,
+        };
+        if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                &table, g->selected, DS4_N_EXPERT_USED)) return false;
+    }
     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
@@ -40087,15 +40104,36 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
+#include "argodrive_profile.h"
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    const bool ar_profile = ar_timing_enabled();
+    const double ar_start = ar_profile ? now_sec() : 0;
+    ar_step_time ar_time = {.pos=g->pos};
+    double ar_gpu_start[9];
+    if (ar_profile) ar_gpu_profile_snapshot(ar_gpu_start);
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
-    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
-        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+    unsigned ar_engram_readers=1;
+    const char *ar_er=getenv("DS4_ARGODRIVE_ENGRAM_READERS");
+    if (ar_er && *ar_er) {
+        char *end;unsigned long n=strtoul(ar_er,&end,10);
+        if (*end || n<1 || n>16) return false;
+        ar_engram_readers=(unsigned)n;
     }
+    static unsigned ar_engram_announced;
+    if (ar_engram_announced!=ar_engram_readers) {
+        fprintf(stderr,"ds4: Argodrive Engram readers=%u\n",ar_engram_readers);
+        ar_engram_announced=ar_engram_readers;
+    }
+    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+        if (!ds4_engram_read_parallel(&g->table[i], ids[i], DS4_ENGRAM_COLS,
+                                     g->rows[i], ar_engram_readers)) return false;
+    }
+    if (ar_profile) ar_time.engram = now_sec() - ar_start;
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
         !ds4_gpu_begin_commands()) return false;
@@ -40104,8 +40142,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* Keep explicit drains before reusing Engram rows and publishing logits.
+     * Routed expert selection still performs its required readback boundary;
+     * this experiment removes only the extra boundary at every layer end. */
+    const bool queue_layers = (g->tp_world == 2 && !g->imatrix &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE")) ||
+        (g->tp_world == 1 && !g->quality && !g->imatrix &&
+         getenv("DS4_ARGODRIVE_QUEUE_LAYERS") != NULL);
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -40114,12 +40157,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             const uint32_t i = il == 1 ? 0 : 1;
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
+        double ar_mark = ar_profile ? now_sec() : 0;
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
+        if (ar_profile) ar_time.layer += now_sec() - ar_mark;
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        if (ar_profile) ar_mark = now_sec();
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        if (ar_profile) ar_time.drain += now_sec() - ar_mark;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -40131,10 +40178,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+    const double ar_logits_start = ar_profile ? now_sec() : 0;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (ar_profile) ar_time.logits = now_sec() - ar_logits_start;
     if (!ok) {
         g->valid = false;
         return false;
+    }
+    if (ar_profile) {
+        ar_time.total = now_sec() - ar_start;
+        ar_gpu_profile_snapshot(ar_time.detail);
+        for (unsigned i=0;i<9;i++) ar_time.detail[i] -= ar_gpu_start[i];
+        ar_timing_add(ar_time);
     }
     g->history = next_history;
     g->pos++;

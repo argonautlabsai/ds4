@@ -60,4 +60,9 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
 
+/* Bounded 1..16-reader decode variant. Whole rows and unchanged arithmetic;
+ * all writers join before success or failure is returned. */
+bool ds4_engram_read_parallel(const ds4_engram_table *table, const uint32_t *rows,
+                              size_t count, float *out, unsigned readers);
+
 #endif

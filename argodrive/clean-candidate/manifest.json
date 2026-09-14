@@ -1,0 +1,11 @@
+{
+  "base_commit": "bd66c402070042bf0a79ad6ece8242de4c93680c",
+  "binary_sha256": "c5b41aedb2bf4cabe2f59717ec58b71388a3f100953dc7e6eb18e46cd1e12f71",
+  "files": {
+    "argodrive_profile.h": "6f9a85c39c350bbbbc9c7ff65a09df78eb3c31291b6e88f1be2c4eae18492649",
+    "argodrive_read.h": "442a7de846e888fc4dc88811c1d41d30ebe9232c509459d0b0c95946b23b8db1",
+    "candidate.patch": "4c27784c9755179201354fe3742689c046432d9a122fcb7f420cfaf255553ad2",
+    "README.md": "c5d0d625f33ff7df483480caaa9e4c570ebf334e246995243cd6439fd9e04f9f"
+  },
+  "qualification_scope": "30 local benchmark arms and separate bounded correctness checks; see README and evidence"
+}

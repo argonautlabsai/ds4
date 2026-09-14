@@ -1,0 +1,546 @@
+diff --git a/Makefile b/Makefile
+index 06052a0..4d8c359 100644
+--- a/Makefile
++++ b/Makefile
+@@ -857,3 +857,7 @@ clean:
+ 	rm -f tests/test_metal_tp_spec
+ 	rm -f tests/test_metal_tp_cancel
+ 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
++
++# Argodrive source dependencies.
++ds4.o: argodrive_profile.h
++ds4_metal.o: argodrive_read.h
+diff --git a/ds4.c b/ds4.c
+index 4b66c32..b6f5161 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -39685,6 +39685,23 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
+             m->map, m->size, bias->abs_offset, 0, 0, token,
+             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+             g->route_logits)) return false;
++    /* Exact router IDs are available now. Begin their reads before encoding
++     * shared-expert work, using the existing bounded loader and ownership rules.
++     * The routed operation consumes the matching prefetched IDs and joins reads. */
++    if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix &&
++        getenv("DS4_ARGODRIVE_EARLY_EXPERTS") != NULL) {
++        const ds4_gpu_stream_expert_table table = {
++            .model_map=m->map, .model_size=m->size, .layer=il,
++            .n_total_expert=DS4_N_EXPERT,
++            .gate_offset=l->ffn_gate_exps->abs_offset,
++            .up_offset=l->ffn_up_exps->abs_offset,
++            .down_offset=l->ffn_down_exps->abs_offset,
++            .gate_expert_bytes=gate_row * DS4_N_FF_EXP,
++            .down_expert_bytes=down_row * DS4_N_EMBD,
++        };
++        if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
++                &table, g->selected, DS4_N_EXPERT_USED)) return false;
++    }
+     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
+         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
+         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
+@@ -40087,15 +40104,36 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
+         ds41_sum_partial_batch(g, b->routed, il, count);
+ }
+ 
++#include "argodrive_profile.h"
++
+ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
+                                              const ds4_weights *w, int token, float *logits) {
+     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
++    const bool ar_profile = ar_timing_enabled();
++    const double ar_start = ar_profile ? now_sec() : 0;
++    ar_step_time ar_time = {.pos=g->pos};
++    double ar_gpu_start[9];
++    if (ar_profile) ar_gpu_profile_snapshot(ar_gpu_start);
+     uint32_t ids[2][DS4_ENGRAM_COLS];
+     ds4_engram_history next_history = g->history;
+     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
++    unsigned ar_engram_readers=1;
++    const char *ar_er=getenv("DS4_ARGODRIVE_ENGRAM_READERS");
++    if (ar_er && *ar_er) {
++        char *end;unsigned long n=strtoul(ar_er,&end,10);
++        if (*end || n<1 || n>16) return false;
++        ar_engram_readers=(unsigned)n;
++    }
++    static unsigned ar_engram_announced;
++    if (ar_engram_announced!=ar_engram_readers) {
++        fprintf(stderr,"ds4: Argodrive Engram readers=%u\n",ar_engram_readers);
++        ar_engram_announced=ar_engram_readers;
++    }
+     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+-        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
++        if (!ds4_engram_read_parallel(&g->table[i], ids[i], DS4_ENGRAM_COLS,
++                                     g->rows[i], ar_engram_readers)) return false;
+     }
++    if (ar_profile) ar_time.engram = now_sec() - ar_start;
+     const float initial_pre[] = {1, 0, 0, 0};
+     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
+         !ds4_gpu_begin_commands()) return false;
+@@ -40104,8 +40142,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model
+      * layer mapped, using the same admitted reserve as layer-major prefill. */
+     const bool layer_resident = g->streaming && g->quality;
+     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
+-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
+-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
++    /* Keep explicit drains before reusing Engram rows and publishing logits.
++     * Routed expert selection still performs its required readback boundary;
++     * this experiment removes only the extra boundary at every layer end. */
++    const bool queue_layers = (g->tp_world == 2 && !g->imatrix &&
++        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE")) ||
++        (g->tp_world == 1 && !g->quality && !g->imatrix &&
++         getenv("DS4_ARGODRIVE_QUEUE_LAYERS") != NULL);
+     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+         const ds4_layer_weights *l = &w->layer[il];
+         if (layer_resident)
+@@ -40114,12 +40157,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model
+             const uint32_t i = il == 1 ? 0 : 1;
+             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+         }
++        double ar_mark = ar_profile ? now_sec() : 0;
+         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
++        if (ar_profile) ar_time.layer += now_sec() - ar_mark;
+         /* TP gates already submit ordered, bounded command buffers. Drain
+          * before overwriting the first Engram table's shared input at layer
+          * 14, and before publishing the completed token to the CPU. */
+         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
++        if (ar_profile) ar_mark = now_sec();
+         if (drain && !ds4_gpu_end_commands()) ok = false;
++        if (ar_profile) ar_time.drain += now_sec() - ar_mark;
+         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+         if (ok && g->imatrix)
+             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
+@@ -40131,11 +40178,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model
+     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
+     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
++    const double ar_logits_start = ar_profile ? now_sec() : 0;
+     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
++    if (ar_profile) ar_time.logits = now_sec() - ar_logits_start;
+     if (!ok) {
+         g->valid = false;
+         return false;
+     }
++    if (ar_profile) {
++        ar_time.total = now_sec() - ar_start;
++        ar_gpu_profile_snapshot(ar_time.detail);
++        for (unsigned i=0;i<9;i++) ar_time.detail[i] -= ar_gpu_start[i];
++        ar_timing_add(ar_time);
++    }
+     g->history = next_history;
+     g->pos++;
+     return true;
+diff --git a/ds4_bench.c b/ds4_bench.c
+index 44eb49d..81faca8 100644
+--- a/ds4_bench.c
++++ b/ds4_bench.c
+@@ -833,6 +833,8 @@ int main(int argc, char **argv) {
+         }
+         const double prefill_t1 = bench_now_sec();
+         const double prefill_sec = prefill_t1 - prefill_t0;
++        if (getenv("DS4_ARGODRIVE_PHASES"))
++            fprintf(stderr, "ARGODRIVE_PHASE prefill %.9f %.9f\n", prefill_t0, prefill_t1);
+         if (getenv("DS4_METAL_CB_TIMES"))
+             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
+                     prefill_t0 * 1e3, prefill_t1 * 1e3);
+@@ -982,6 +984,8 @@ int main(int argc, char **argv) {
+             }
+         }
+         const double gen_t1 = bench_now_sec();
++        if (getenv("DS4_ARGODRIVE_PHASES"))
++            fprintf(stderr, "ARGODRIVE_PHASE decode %.9f %.9f\n", gen_t0, gen_t1);
+         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
+             for (int i = 0; i < gen_token_count; i++) {
+diff --git a/ds4_engram.c b/ds4_engram.c
+index 0563515..6e71c60 100644
+--- a/ds4_engram.c
++++ b/ds4_engram.c
+@@ -275,3 +275,45 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
+     errno = saved;
+     return ok;
+ }
++
++
++#ifdef __APPLE__
++typedef struct {
++    const ds4_engram_table *table;
++    const uint32_t *rows;
++    float *out;
++    size_t count, readers;
++    int error[16];
++} ar_engram_parallel;
++static void ar_engram_read_part(void *context, size_t part) {
++    ar_engram_parallel *b=context;
++    const size_t first=b->count*part/b->readers;
++    const size_t end=b->count*(part+1)/b->readers;
++    if (!ds4_engram_read(b->table,b->rows+first,end-first,
++                        b->out+first*DS4_ENGRAM_DIM))
++        b->error[part]=errno ? errno : EIO;
++}
++#endif
++
++bool ds4_engram_read_parallel(const ds4_engram_table *t, const uint32_t *rows,
++                              size_t count, float *out, unsigned readers) {
++    if (!t || t->fd<0 || !readers || readers>16 ||
++        (count && (!rows || !out)) ||
++        count>SIZE_MAX/(DS4_ENGRAM_DIM*sizeof(*out))) {
++        errno=EINVAL;return false;
++    }
++    // Validate all row indices before writing any output. A read/decode failure
++    // invalidates the output, just as in the serial API, after all workers join.
++    for (size_t i=0;i<count;i++) if (rows[i]>=t->rows) {errno=EINVAL;return false;}
++    if (count<2 || readers==1) return ds4_engram_read(t,rows,count,out);
++#ifdef __APPLE__
++    if (readers>count) readers=(unsigned)count;
++    ar_engram_parallel batch={.table=t,.rows=rows,.out=out,.count=count,.readers=readers};
++    dispatch_apply_f(readers,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),
++                     &batch,ar_engram_read_part);
++    for (unsigned i=0;i<readers;i++) if (batch.error[i]) {errno=batch.error[i];return false;}
++    return true;
++#else
++    return ds4_engram_read(t,rows,count,out);
++#endif
++}
+diff --git a/ds4_engram.h b/ds4_engram.h
+index 1cc9c3c..a1dd030 100644
+--- a/ds4_engram.h
++++ b/ds4_engram.h
+@@ -60,4 +60,9 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
+ bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
+                            size_t tokens, size_t stride, float *out);
+ 
++/* Bounded 1..16-reader decode variant. Whole rows and unchanged arithmetic;
++ * all writers join before success or failure is returned. */
++bool ds4_engram_read_parallel(const ds4_engram_table *table, const uint32_t *rows,
++                              size_t count, float *out, unsigned readers);
++
+ #endif
+diff --git a/ds4_metal.m b/ds4_metal.m
+index b61cbee..da4d516 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -25,6 +25,9 @@
+ #include "ds4.h"
+ #include "ds4_gpu.h"
+ #include "ds4_image.h"
++#include "argodrive_read.h"
++static ar_reader g_argodrive_reader;
++static uint64_t ar_resident_gate_layers;
+ 
+ /*
+  * Objective-C Metal glue for the C engine.
+@@ -1328,6 +1331,25 @@ static void ds4_gpu_close_batch_encoder(void) {
+     g_batch_enc = nil;
+ }
+ 
++static double ds4_gpu_now_ms(void);
++static double ar_gpu_busy_ms, ar_gpu_wait_ms, ar_gpu_buffers;
++static int ar_gpu_profile_enabled(void) {
++    static int cached = -1;
++    if (cached < 0) cached = getenv("DS4_ARGODRIVE_TIMELINE") != NULL;
++    return cached;
++}
++/* Single-worker diagnostic snapshots. Command-buffer spans are not kernel-only
++ * compute time; CPU waits overlap these spans and must not be added to them. */
++void ar_gpu_profile_snapshot(double out[9]) {
++    out[0]=ar_gpu_busy_ms; out[1]=ar_gpu_wait_ms; out[2]=ar_gpu_buffers;
++    out[3]=g_stream_expert_timing_load_pread_ms;
++    out[4]=g_stream_expert_timing_load_prepare_ms;
++    out[5]=g_stream_expert_timing_load_install_ms;
++    out[6]=g_stream_expert_timing_selected_sync_ms;
++    out[7]=(double)g_stream_expert_timing_cache_missing_experts;
++    out[8]=(double)g_stream_expert_timing_cache_resident_experts;
++}
++
+ static double g_gpu_busy_accum;
+ static uint64_t g_gpu_busy_cbs;
+ 
+@@ -1343,7 +1365,15 @@ static void ds4_gpu_invalidate_completion_counters(void) {
+ }
+ 
+ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
++    const int ar_profile = ar_gpu_profile_enabled();
++    const double ar_start = ar_profile ? ds4_gpu_now_ms() : 0;
+     [cb waitUntilCompleted];
++    if (ar_profile) {
++        ar_gpu_wait_ms += ds4_gpu_now_ms() - ar_start;
++        const double span = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
++        if (span > 0) ar_gpu_busy_ms += span;
++        ar_gpu_buffers++;
++    }
+     if (getenv("DS4_METAL_CB_TIMES")) {
+         static double prev_gpu_end;
+         static uint64_t n_printed;
+@@ -11770,6 +11800,8 @@ void ds4_gpu_cleanup(void) {
+         g_moe_q4_up_slots_buffer = nil;
+         g_moe_q4_down_slots_buffer = nil;
+         g_attn_out_group_ids_buffer = nil;
++        fprintf(stderr,"ds4: Argodrive resident_gate_layers=%llu\n",(unsigned long long)ar_resident_gate_layers);
++    ar_close(&g_argodrive_reader);
+         g_model_fd = -1;
+         g_model_map_ptr = NULL;
+         g_model_map_size = 0;
+@@ -12729,6 +12761,12 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+ 
+ int ds4_gpu_set_model_fd(int fd) {
+     g_model_fd = fd;
++    const char *replicas = getenv("DS4_ARGODRIVE_REPLICAS");
++    if (!ar_open(&g_argodrive_reader, fd, replicas, getenv("DS4_ARGODRIVE_PRIMARY_WEIGHT"))) {
++        fprintf(stderr, "ds4: invalid Argodrive replica configuration; expert reads will fail closed\n");
++        return 0;
++    }
++    if (g_argodrive_reader.count) fprintf(stderr, "ds4: experimental Argodrive expert reader sources=%u; Engram unchanged\n",g_argodrive_reader.count);
+     return 1;
+ }
+ 
+@@ -13030,7 +13068,8 @@ static int ds4_gpu_stream_expert_timing_summary_enabled(void) {
+     static int enabled = 0;
+     if (!checked) {
+         enabled =
+-            (getenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") != NULL ||
++            (getenv("DS4_ARGODRIVE_TIMELINE") != NULL ||
++             getenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") != NULL ||
+              getenv("DS4_METAL_STREAMING_EXPERT_PROFILE_SUMMARY") != NULL) &&
+             getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY") == NULL;
+         checked = 1;
+@@ -13320,6 +13359,15 @@ static int ds4_gpu_stream_expert_pread_into(
+     }
+ 
+     const double t0 = ds4_gpu_now_ms();
++    if (g_argodrive_reader.invalid) return 0;
++    if (g_argodrive_reader.count) {
++        uint64_t actual = 0;
++        int ok = ar_read(&g_argodrive_reader, offset, len, dst, &actual);
++        if (read_bytes) *read_bytes = actual;
++        if (ms_out) *ms_out = ds4_gpu_now_ms() - t0;
++        if (!ok) fprintf(stderr, "ds4: Argodrive partial expert read rejected\n");
++        return ok;
++    }
+     uint64_t pos = 0;
+     int ok = 1;
+     while (pos < len) {
+@@ -32222,7 +32270,10 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
+         NSUInteger                  weights_off,
+         NSUInteger                  threadgroup_bytes,
+         NSUInteger                  nsg,
+-        bool                        rows_per_group_is_nr0) {
++        bool                        rows_per_group_is_nr0,
++        uint32_t                    active_mask) {
++    if (active_mask) pipeline = ds4_gpu_get_mul_mv_pipeline(
++            "kernel_argodrive_slots6_q4_pair_masked", (int16_t)nsg);
+     if (!cb || !pipeline || !args || !act || !src0_a || !src0_a_off || !src0_b || !src0_b_off ||
+         !src1 || !dst_a || !dst_b || !dst_mid || !weights ||
+         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0) {
+@@ -32252,6 +32303,7 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
+     [enc setBuffer:dst_b   offset:dst_b_off   atIndex:16];
+     [enc setBuffer:dst_mid offset:dst_mid_off atIndex:17];
+     [enc setBuffer:weights offset:weights_off atIndex:18];
++    if (active_mask) [enc setBytes:&active_mask length:sizeof(active_mask) atIndex:19];
+     if (threadgroup_bytes != 0) {
+         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+     }
+@@ -40338,6 +40390,7 @@ int ds4_gpu_routed_moe_one_tensor(
+         bool stream_expert_split_completed = false;
+         uint32_t stream_expert_resident_mask = 0;
+         uint32_t stream_expert_missing_mask = 0;
++        uint32_t ar_resident_gate_done = 0;
+         __unsafe_unretained id<MTLBuffer> gate_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
+         __unsafe_unretained id<MTLBuffer> up_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
+         __unsafe_unretained id<MTLBuffer> down_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
+@@ -40915,6 +40968,9 @@ int ds4_gpu_routed_moe_one_tensor(
+         const bool use_selected_slots =
+             use_q4_selected_slots || use_iq2_selected_slots ||
+             use_mxfp4_selected_slots || use_iq2_stream_addr_table;
++        const char *ar_rg_env = getenv("DS4_ARGODRIVE_RESIDENT_GATE");
++        const bool ar_rg_requested = ar_rg_env && strcmp(ar_rg_env,"0") != 0 &&
++            use_q4_selected_slots && !g_quality_mode && g_tp_split_world == 1;
+         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
+             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
+             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
+@@ -41353,7 +41409,7 @@ int ds4_gpu_routed_moe_one_tensor(
+                      * Submit the shared expert work while the reads finish. */
+                     selected_id_source = "prefetched";
+                     if (g_batch_cb && g_batch_has_work &&
+-                        g_stream_expert_pending_load.active &&
++                        g_stream_expert_pending_load.active && !ar_rg_requested &&
+                         !ds4_gpu_flush_commands()) return 0;
+                 } else if (use_stream_hit_validator) {
+                     g_routed_moe_selected_override_n = 0;
+@@ -41621,8 +41677,50 @@ int ds4_gpu_routed_moe_one_tensor(
+                         return 0;
+                     }
+                 }
++                if (ar_rg_requested &&
++                    n_expert == 6 && stream_expert_resident_mask && stream_expert_missing_mask &&
++                    g_batch_cb && g_stream_expert_pending_load.active &&
++                    ds4_gpu_stream_expert_pending_load_matches(model_map, model_size,
++                        layer_index, selected_ids, n_total_expert, n_expert,
++                        gate_expert_bytes, down_expert_bytes) &&
++                    getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL) {
++                    /* Encode only already-cached gate/up rows while the existing
++                     * asynchronous loader owns missing buffers. Each skipped
++                     * slot binds a valid dummy but reads/writes nothing. Encoder
++                     * bindings are snapshots; later host-array edits cannot
++                     * replace the resources of this submitted command buffer. */
++                    __unsafe_unretained id<MTLBuffer> rg_gate[6], rg_up[6];
++                    NSUInteger rg_gate_off[6], rg_up_off[6];
++                    unsigned dummy = (unsigned)__builtin_ctz(stream_expert_resident_mask);
++                    for (unsigned i=0;i<6;i++) {
++                        unsigned j=(stream_expert_resident_mask&(1u<<i))?i:dummy;
++                        rg_gate[i]=gate_slot_bufs[j];rg_gate_off[i]=gate_slot_offsets[j];
++                        rg_up[i]=up_slot_bufs[j];rg_up_off[i]=up_slot_offsets[j];
++                    }
++                    ds4_gpu_dsv4_moe_swiglu_weight_args rg_act = {
++                        .width=expert_mid_dim,.rows=pair_rows,
++                        .gate_row_stride=(uint64_t)expert_mid_dim*sizeof(float),
++                        .up_row_stride=(uint64_t)expert_mid_dim*sizeof(float),
++                        .mid_row_stride=(uint64_t)expert_mid_dim*sizeof(float),
++                        .weight_stride=sizeof(float),.write_clamped=0,.clamp_value=clamp,
++                    };
++                    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(
++                            stream_slot_entries,n_expert,stream_expert_resident_mask) ||
++                        !ds4_gpu_encode_mul_mv_slots6_pair_swiglu(g_batch_cb,
++                            slots_pair_swiglu_pipeline,&gate_args,&rg_act,
++                            rg_gate,rg_gate_off,rg_up,rg_up_off,
++                            xbuf,ds4_gpu_tensor_offset(x),gatebuf,ds4_gpu_tensor_offset(gate),
++                            upbuf,ds4_gpu_tensor_offset(up),midbuf,ds4_gpu_tensor_offset(mid),
++                            weightsbuf,ds4_gpu_tensor_offset(weights),gate_smem,2,false,
++                            stream_expert_resident_mask) || !ds4_gpu_flush_commands()) return 0;
++                    ar_resident_gate_done=stream_expert_resident_mask;
++                    ar_resident_gate_layers++;
++                }
+                 if (stream_expert_missing_mask != 0 &&
+                     !use_stream_expert_split_deferred) {
++                    if (ar_rg_requested && !ar_resident_gate_done && g_batch_cb &&
++                        g_batch_has_work && g_stream_expert_pending_load.active &&
++                        !ds4_gpu_flush_commands()) return 0;
+                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
+                             model_map,
+                             model_size,
+@@ -42462,7 +42560,8 @@ int ds4_gpu_routed_moe_one_tensor(
+                                                               ds4_gpu_tensor_offset(weights),
+                                                               gate_smem,
+                                                               2,
+-                                                              false);
++                                                              false,
++                                                              ar_resident_gate_done ? stream_expert_missing_mask : 0u);
+             }
+         } else if (fuse_pair_swiglu) {
+             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+diff --git a/metal/moe.metal b/metal/moe.metal
+index b24e27a..94b7aa6 100644
+--- a/metal/moe.metal
++++ b/metal/moe.metal
+@@ -5313,6 +5313,112 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
+     (void)tiitg;
+ }
+ 
++// Same arithmetic, disjoint selected-slot writes; skip before any weight read.
++kernel void kernel_argodrive_slots6_q4_pair_masked(
++        constant ds4_metal_args_mul_mv_id & args,
++        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
++        device const char * src0_gate0,
++        device const char * src0_gate1,
++        device const char * src0_gate2,
++        device const char * src0_gate3,
++        device const char * src0_gate4,
++        device const char * src0_gate5,
++        device const char * src0_up0,
++        device const char * src0_up1,
++        device const char * src0_up2,
++        device const char * src0_up3,
++        device const char * src0_up4,
++        device const char * src0_up5,
++        device const char * src1,
++        device       char * dst_gate,
++        device       char * dst_up,
++        device       char * dst_mid,
++        device const char * weights,
++        constant uint &active_mask,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    const int iid1 = tgpig.z / args.nei0;
++    const int idx  = tgpig.z % args.nei0;
++    if ((active_mask & (1u << uint(idx))) == 0u) return;
++
++    tgpig.z = 0;
++
++    const int64_t i11 = idx % args.ne11;
++    const int64_t i12 = iid1;
++
++    device const char *src0_gate_cur = src0_gate0;
++    device const char *src0_up_cur = src0_up0;
++    switch (idx) {
++    case 1: src0_gate_cur = src0_gate1; src0_up_cur = src0_up1; break;
++    case 2: src0_gate_cur = src0_gate2; src0_up_cur = src0_up2; break;
++    case 3: src0_gate_cur = src0_gate3; src0_up_cur = src0_up3; break;
++    case 4: src0_gate_cur = src0_gate4; src0_up_cur = src0_up4; break;
++    case 5: src0_gate_cur = src0_gate5; src0_up_cur = src0_up5; break;
++    default: break;
++    }
++
++    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
++
++    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
++    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
++
++    ds4_metal_args_mul_mv args0 = {
++        args.ne00, args.ne01, 1,
++        args.nb00, args.nb01, args.nb02, args.nb02,
++        args.ne10, 1, 1,
++        args.nb10, args.nb11, args.nb12, args.nb12,
++        args.ne0, 1, args.nr0, 1, 1,
++    };
++
++    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
++        args0,
++        src0_gate_cur,
++        src1_cur,
++        dst_gate_cur,
++        shmem,
++        tgpig,
++        tiisg,
++        sgitg);
++    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
++        args0,
++        src0_up_cur,
++        src1_cur,
++        dst_up_cur,
++        shmem,
++        tgpig,
++        tiisg,
++        sgitg);
++
++    const short NSG = FC_mul_mv_nsg;
++    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
++    device float *gate_f32 = (device float *)dst_gate_cur;
++    device float *up_f32 = (device float *)dst_up_cur;
++    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
++    device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
++    device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
++    const float c = act.clamp_value;
++    const float route_weight = route_w[0];
++
++    if (tiisg == 0) {
++        for (int row = 0; row < N_R0_Q4_K && first_row + row < args.ne0; ++row) {
++            const uint out_row = first_row + row;
++            float g = gate_f32[out_row];
++            float u = up_f32[out_row];
++            if (c > 1.0e-6f) {
++                g = min(g, c);
++                u = clamp(u, -c, c);
++            }
++            const float silu = g / (1.0f + exp(-g));
++            mid_f32[out_row] = silu * u * route_weight;
++        }
++    }
++
++    (void)tiitg;
++}
++
+ static inline device const char *ds4_q4_group24_select(
+         uint32_t group_id,
+         device const char *src00,

@@ -1,3 +1,29 @@
+# Argodrive DeepSeek V4.1 benchmark engine
+
+Built with [ARGODRIVE](https://github.com/argonautlabsai/argodrive), based on [antirez/ds4](https://github.com/antirez/ds4).
+
+This branch includes the actual expert replica reader and Metal scheduling changes used by the frozen V4.1 experiment. No separate provider library is required. It is pinned to upstream `bd66c402070042bf0a79ad6ece8242de4c93680c`. The earlier `argonaut-v41` branch contains a different GLM integration and is not this benchmark engine.
+
+## Build and reproduce
+
+```sh
+git clone --branch argonaut-v41-benchmark https://github.com/argonautlabsai/ds4.git
+cd ds4
+make -j4 ds4 ds4-bench ds4-server
+```
+
+Follow [the complete recipe](argodrive/reproduce/README.md) to verify model copies and run internal-only, one-enclosure and two-enclosure configurations. The recipe includes a pinned upstream control, physical disk sampler, output comparison and sanitizer fixtures. Model files are not included.
+
+The reader is implemented in `argodrive_read.h`: complete identical GGUF replicas, 256 KiB block splitting with weights 2:1:1, concurrent reads into disjoint buffer spans, and a completion barrier that rejects partial buffers. Scheduling changes live in `ds4.c`, `ds4_metal.m`, and `metal/moe.metal`. Engram uses eight parallel whole-row readers on the primary SSD. This branch does not implement Engram striping, a learned placement policy, or the GLM expected-completion balancer.
+
+## Measurement status
+
+**16.31 tok/s is a historical steady-decode maximum at pp512/tg128, excluding the first decode step. The same arm was 14.70 tok/s including that step.** It is not a guaranteed result or a final publication claim. The three historical pp512/tg512 runs were 15.49–15.56 tok/s including the first step. See [the metric table](argodrive/results/frozen-summary.json).
+
+Fresh-clone execution, quality regression, client-observed first-token timing and phase-aligned byte accounting are being qualified. Results use one raw completion prompt; task quality and chat timing are separate. See [credits](CREDITS.md) for attribution. CUDA and distributed execution of these additions are unqualified.
+
+---
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>

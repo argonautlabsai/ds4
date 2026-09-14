@@ -5313,6 +5313,112 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
+// Same arithmetic, disjoint selected-slot writes; skip before any weight read.
+kernel void kernel_argodrive_slots6_q4_pair_masked(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate0,
+        device const char * src0_gate1,
+        device const char * src0_gate2,
+        device const char * src0_gate3,
+        device const char * src0_gate4,
+        device const char * src0_gate5,
+        device const char * src0_up0,
+        device const char * src0_up1,
+        device const char * src0_up2,
+        device const char * src0_up3,
+        device const char * src0_up4,
+        device const char * src0_up5,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * weights,
+        constant uint &active_mask,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+    if ((active_mask & (1u << uint(idx))) == 0u) return;
+
+    tgpig.z = 0;
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char *src0_gate_cur = src0_gate0;
+    device const char *src0_up_cur = src0_up0;
+    switch (idx) {
+    case 1: src0_gate_cur = src0_gate1; src0_up_cur = src0_up1; break;
+    case 2: src0_gate_cur = src0_gate2; src0_up_cur = src0_up2; break;
+    case 3: src0_gate_cur = src0_gate3; src0_up_cur = src0_up3; break;
+    case 4: src0_gate_cur = src0_gate4; src0_up_cur = src0_up4; break;
+    case 5: src0_gate_cur = src0_gate5; src0_up_cur = src0_up5; break;
+    default: break;
+    }
+
+    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+
+    device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+    device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00, args.ne01, 1,
+        args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1,
+        args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+        args0,
+        src0_gate_cur,
+        src1_cur,
+        dst_gate_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+        args0,
+        src0_up_cur,
+        src1_cur,
+        dst_up_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
+    device float *gate_f32 = (device float *)dst_gate_cur;
+    device float *up_f32 = (device float *)dst_up_cur;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+
+    if (tiisg == 0) {
+        for (int row = 0; row < N_R0_Q4_K && first_row + row < args.ne0; ++row) {
+            const uint out_row = first_row + row;
+            float g = gate_f32[out_row];
+            float u = up_f32[out_row];
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            const float silu = g / (1.0f + exp(-g));
+            mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    (void)tiitg;
+}
+
 static inline device const char *ds4_q4_group24_select(
         uint32_t group_id,
         device const char *src00,

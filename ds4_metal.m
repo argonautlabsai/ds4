@@ -25,6 +25,16 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "argodrive_read.h"
+static ar_reader g_argodrive_reader;
+/* Cumulative successful expert pread bytes; phase subtraction belongs to the
+ * observer. Snapshot does not wait for GPU work or reset live reader counters. */
+void ar_expert_bytes_snapshot(uint64_t out[3]) {
+    for (unsigned i=0;i<3;i++)
+        out[i]=__atomic_load_n(&g_argodrive_reader.source[i].bytes,__ATOMIC_RELAXED);
+}
+
+static uint64_t ar_resident_gate_layers;
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -1328,6 +1338,25 @@ static void ds4_gpu_close_batch_encoder(void) {
     g_batch_enc = nil;
 }
 
+static double ds4_gpu_now_ms(void);
+static double ar_gpu_busy_ms, ar_gpu_wait_ms, ar_gpu_buffers;
+static int ar_gpu_profile_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_ARGODRIVE_TIMELINE") != NULL;
+    return cached;
+}
+/* Single-worker diagnostic snapshots. Command-buffer spans are not kernel-only
+ * compute time; CPU waits overlap these spans and must not be added to them. */
+void ar_gpu_profile_snapshot(double out[9]) {
+    out[0]=ar_gpu_busy_ms; out[1]=ar_gpu_wait_ms; out[2]=ar_gpu_buffers;
+    out[3]=g_stream_expert_timing_load_pread_ms;
+    out[4]=g_stream_expert_timing_load_prepare_ms;
+    out[5]=g_stream_expert_timing_load_install_ms;
+    out[6]=g_stream_expert_timing_selected_sync_ms;
+    out[7]=(double)g_stream_expert_timing_cache_missing_experts;
+    out[8]=(double)g_stream_expert_timing_cache_resident_experts;
+}
+
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
@@ -1343,7 +1372,15 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 }
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    const int ar_profile = ar_gpu_profile_enabled();
+    const double ar_start = ar_profile ? ds4_gpu_now_ms() : 0;
     [cb waitUntilCompleted];
+    if (ar_profile) {
+        ar_gpu_wait_ms += ds4_gpu_now_ms() - ar_start;
+        const double span = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        if (span > 0) ar_gpu_busy_ms += span;
+        ar_gpu_buffers++;
+    }
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -11770,6 +11807,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_up_slots_buffer = nil;
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
+        fprintf(stderr,"ds4: Argodrive resident_gate_layers=%llu\n",(unsigned long long)ar_resident_gate_layers);
+    ar_close(&g_argodrive_reader);
         g_model_fd = -1;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
@@ -12729,6 +12768,12 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    const char *replicas = getenv("DS4_ARGODRIVE_REPLICAS");
+    if (!ar_open(&g_argodrive_reader, fd, replicas, getenv("DS4_ARGODRIVE_PRIMARY_WEIGHT"))) {
+        fprintf(stderr, "ds4: invalid Argodrive replica configuration; expert reads will fail closed\n");
+        return 0;
+    }
+    if (g_argodrive_reader.count) fprintf(stderr, "ds4: experimental Argodrive expert reader sources=%u; Engram unchanged\n",g_argodrive_reader.count);
     return 1;
 }
 
@@ -13030,7 +13075,8 @@ static int ds4_gpu_stream_expert_timing_summary_enabled(void) {
     static int enabled = 0;
     if (!checked) {
         enabled =
-            (getenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") != NULL ||
+            (getenv("DS4_ARGODRIVE_TIMELINE") != NULL ||
+             getenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") != NULL ||
              getenv("DS4_METAL_STREAMING_EXPERT_PROFILE_SUMMARY") != NULL) &&
             getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_TIMING_SUMMARY") == NULL;
         checked = 1;
@@ -13320,6 +13366,15 @@ static int ds4_gpu_stream_expert_pread_into(
     }
 
     const double t0 = ds4_gpu_now_ms();
+    if (g_argodrive_reader.invalid) return 0;
+    if (g_argodrive_reader.count) {
+        uint64_t actual = 0;
+        int ok = ar_read(&g_argodrive_reader, offset, len, dst, &actual);
+        if (read_bytes) *read_bytes = actual;
+        if (ms_out) *ms_out = ds4_gpu_now_ms() - t0;
+        if (!ok) fprintf(stderr, "ds4: Argodrive partial expert read rejected\n");
+        return ok;
+    }
     uint64_t pos = 0;
     int ok = 1;
     while (pos < len) {
@@ -32222,7 +32277,10 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
         NSUInteger                  weights_off,
         NSUInteger                  threadgroup_bytes,
         NSUInteger                  nsg,
-        bool                        rows_per_group_is_nr0) {
+        bool                        rows_per_group_is_nr0,
+        uint32_t                    active_mask) {
+    if (active_mask) pipeline = ds4_gpu_get_mul_mv_pipeline(
+            "kernel_argodrive_slots6_q4_pair_masked", (int16_t)nsg);
     if (!cb || !pipeline || !args || !act || !src0_a || !src0_a_off || !src0_b || !src0_b_off ||
         !src1 || !dst_a || !dst_b || !dst_mid || !weights ||
         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0) {
@@ -32252,6 +32310,7 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
     [enc setBuffer:dst_b   offset:dst_b_off   atIndex:16];
     [enc setBuffer:dst_mid offset:dst_mid_off atIndex:17];
     [enc setBuffer:weights offset:weights_off atIndex:18];
+    if (active_mask) [enc setBytes:&active_mask length:sizeof(active_mask) atIndex:19];
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
@@ -40338,6 +40397,7 @@ int ds4_gpu_routed_moe_one_tensor(
         bool stream_expert_split_completed = false;
         uint32_t stream_expert_resident_mask = 0;
         uint32_t stream_expert_missing_mask = 0;
+        uint32_t ar_resident_gate_done = 0;
         __unsafe_unretained id<MTLBuffer> gate_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
         __unsafe_unretained id<MTLBuffer> up_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
         __unsafe_unretained id<MTLBuffer> down_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
@@ -40915,6 +40975,9 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool use_selected_slots =
             use_q4_selected_slots || use_iq2_selected_slots ||
             use_mxfp4_selected_slots || use_iq2_stream_addr_table;
+        const char *ar_rg_env = getenv("DS4_ARGODRIVE_RESIDENT_GATE");
+        const bool ar_rg_requested = ar_rg_env && strcmp(ar_rg_env,"0") != 0 &&
+            use_q4_selected_slots && !g_quality_mode && g_tp_split_world == 1;
         id<MTLComputePipelineState> slots_pair_swiglu_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline :
             (use_mxfp4_selected_slots ? g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline :
@@ -41353,7 +41416,7 @@ int ds4_gpu_routed_moe_one_tensor(
                      * Submit the shared expert work while the reads finish. */
                     selected_id_source = "prefetched";
                     if (g_batch_cb && g_batch_has_work &&
-                        g_stream_expert_pending_load.active &&
+                        g_stream_expert_pending_load.active && !ar_rg_requested &&
                         !ds4_gpu_flush_commands()) return 0;
                 } else if (use_stream_hit_validator) {
                     g_routed_moe_selected_override_n = 0;
@@ -41621,8 +41684,50 @@ int ds4_gpu_routed_moe_one_tensor(
                         return 0;
                     }
                 }
+                if (ar_rg_requested &&
+                    n_expert == 6 && stream_expert_resident_mask && stream_expert_missing_mask &&
+                    g_batch_cb && g_stream_expert_pending_load.active &&
+                    ds4_gpu_stream_expert_pending_load_matches(model_map, model_size,
+                        layer_index, selected_ids, n_total_expert, n_expert,
+                        gate_expert_bytes, down_expert_bytes) &&
+                    getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL) {
+                    /* Encode only already-cached gate/up rows while the existing
+                     * asynchronous loader owns missing buffers. Each skipped
+                     * slot binds a valid dummy but reads/writes nothing. Encoder
+                     * bindings are snapshots; later host-array edits cannot
+                     * replace the resources of this submitted command buffer. */
+                    __unsafe_unretained id<MTLBuffer> rg_gate[6], rg_up[6];
+                    NSUInteger rg_gate_off[6], rg_up_off[6];
+                    unsigned dummy = (unsigned)__builtin_ctz(stream_expert_resident_mask);
+                    for (unsigned i=0;i<6;i++) {
+                        unsigned j=(stream_expert_resident_mask&(1u<<i))?i:dummy;
+                        rg_gate[i]=gate_slot_bufs[j];rg_gate_off[i]=gate_slot_offsets[j];
+                        rg_up[i]=up_slot_bufs[j];rg_up_off[i]=up_slot_offsets[j];
+                    }
+                    ds4_gpu_dsv4_moe_swiglu_weight_args rg_act = {
+                        .width=expert_mid_dim,.rows=pair_rows,
+                        .gate_row_stride=(uint64_t)expert_mid_dim*sizeof(float),
+                        .up_row_stride=(uint64_t)expert_mid_dim*sizeof(float),
+                        .mid_row_stride=(uint64_t)expert_mid_dim*sizeof(float),
+                        .weight_stride=sizeof(float),.write_clamped=0,.clamp_value=clamp,
+                    };
+                    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(
+                            stream_slot_entries,n_expert,stream_expert_resident_mask) ||
+                        !ds4_gpu_encode_mul_mv_slots6_pair_swiglu(g_batch_cb,
+                            slots_pair_swiglu_pipeline,&gate_args,&rg_act,
+                            rg_gate,rg_gate_off,rg_up,rg_up_off,
+                            xbuf,ds4_gpu_tensor_offset(x),gatebuf,ds4_gpu_tensor_offset(gate),
+                            upbuf,ds4_gpu_tensor_offset(up),midbuf,ds4_gpu_tensor_offset(mid),
+                            weightsbuf,ds4_gpu_tensor_offset(weights),gate_smem,2,false,
+                            stream_expert_resident_mask) || !ds4_gpu_flush_commands()) return 0;
+                    ar_resident_gate_done=stream_expert_resident_mask;
+                    ar_resident_gate_layers++;
+                }
                 if (stream_expert_missing_mask != 0 &&
                     !use_stream_expert_split_deferred) {
+                    if (ar_rg_requested && !ar_resident_gate_done && g_batch_cb &&
+                        g_batch_has_work && g_stream_expert_pending_load.active &&
+                        !ds4_gpu_flush_commands()) return 0;
                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
                             model_map,
                             model_size,
@@ -42462,7 +42567,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                               ds4_gpu_tensor_offset(weights),
                                                               gate_smem,
                                                               2,
-                                                              false);
+                                                              false,
+                                                              ar_resident_gate_done ? stream_expert_missing_mask : 0u);
             }
         } else if (fuse_pair_swiglu) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {

@@ -15,6 +15,14 @@
 #include <dispatch/dispatch.h>
 #endif
 
+/* Opt-in read accounting counts successful syscall bytes, including partial
+ * reads on failure. It is independent of decoded rows and physical disk I/O. */
+static uint64_t ar_engram_bytes;
+static int ar_engram_accounting;
+uint64_t ar_engram_bytes_snapshot(void) {
+    return __atomic_load_n(&ar_engram_bytes,__ATOMIC_RELAXED);
+}
+
 bool ds4_engram_layout_valid(const ds4_engram_layout *l) {
     if (!l || !l->token_map || !l->vocab_size ||
         !l->compressed_vocab_size || l->compressed_vocab_size > INT32_MAX ||
@@ -87,6 +95,7 @@ bool ds4_engram_hash(const ds4_engram_layout *l, ds4_engram_history *h,
 bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
                            uint64_t offset, uint32_t rows) {
     if (!t) return false;
+    ar_engram_accounting = getenv("DS4_ARGODRIVE_ACCOUNTING") != NULL;
     *t = (ds4_engram_table){.fd = -1};
     uint64_t bytes = (uint64_t)rows * DS4_ENGRAM_ROW_BYTES;
     if (!path || !rows || offset > INT64_MAX || bytes > INT64_MAX - offset) {
@@ -130,6 +139,7 @@ static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES])
             if (n == 0) errno = EIO;
             return false;
         }
+        if (ar_engram_accounting) __atomic_fetch_add(&ar_engram_bytes,(uint64_t)n,__ATOMIC_RELAXED);
         done += (size_t)n;
     }
     return true;
@@ -274,4 +284,46 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     free(request);
     errno = saved;
     return ok;
+}
+
+
+#ifdef __APPLE__
+typedef struct {
+    const ds4_engram_table *table;
+    const uint32_t *rows;
+    float *out;
+    size_t count, readers;
+    int error[16];
+} ar_engram_parallel;
+static void ar_engram_read_part(void *context, size_t part) {
+    ar_engram_parallel *b=context;
+    const size_t first=b->count*part/b->readers;
+    const size_t end=b->count*(part+1)/b->readers;
+    if (!ds4_engram_read(b->table,b->rows+first,end-first,
+                        b->out+first*DS4_ENGRAM_DIM))
+        b->error[part]=errno ? errno : EIO;
+}
+#endif
+
+bool ds4_engram_read_parallel(const ds4_engram_table *t, const uint32_t *rows,
+                              size_t count, float *out, unsigned readers) {
+    if (!t || t->fd<0 || !readers || readers>16 ||
+        (count && (!rows || !out)) ||
+        count>SIZE_MAX/(DS4_ENGRAM_DIM*sizeof(*out))) {
+        errno=EINVAL;return false;
+    }
+    // Validate all row indices before writing any output. A read/decode failure
+    // invalidates the output, just as in the serial API, after all workers join.
+    for (size_t i=0;i<count;i++) if (rows[i]>=t->rows) {errno=EINVAL;return false;}
+    if (count<2 || readers==1) return ds4_engram_read(t,rows,count,out);
+#ifdef __APPLE__
+    if (readers>count) readers=(unsigned)count;
+    ar_engram_parallel batch={.table=t,.rows=rows,.out=out,.count=count,.readers=readers};
+    dispatch_apply_f(readers,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),
+                     &batch,ar_engram_read_part);
+    for (unsigned i=0;i<readers;i++) if (batch.error[i]) {errno=batch.error[i];return false;}
+    return true;
+#else
+    return ds4_engram_read(t,rows,count,out);
+#endif
 }

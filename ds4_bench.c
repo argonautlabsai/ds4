@@ -75,6 +75,23 @@ typedef struct {
     float dspark_confidence_threshold;
 } bench_config;
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+extern void ar_expert_bytes_snapshot(uint64_t out[3]);
+extern uint64_t ar_engram_bytes_snapshot(void);
+#endif
+static void ar_accounting_snapshot(const char *boundary) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (getenv("DS4_ARGODRIVE_ACCOUNTING")) {
+        uint64_t sources[3]; ar_expert_bytes_snapshot(sources);
+        fprintf(stderr,"ARGODRIVE_BYTES %s %llu %llu %llu %llu\n",boundary,
+            (unsigned long long)sources[0],(unsigned long long)sources[1],
+            (unsigned long long)sources[2],(unsigned long long)ar_engram_bytes_snapshot());
+    }
+#else
+    (void)boundary;
+#endif
+}
+
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -814,6 +831,7 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+        ar_accounting_snapshot("prefill_start");
         const double prefill_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
         const bool cuda_profile_prefill =
@@ -832,7 +850,10 @@ int main(int argc, char **argv) {
             break;
         }
         const double prefill_t1 = bench_now_sec();
+        ar_accounting_snapshot("prefill_end");
         const double prefill_sec = prefill_t1 - prefill_t0;
+        if (getenv("DS4_ARGODRIVE_PHASES"))
+            fprintf(stderr, "ARGODRIVE_PHASE prefill %.9f %.9f\n", prefill_t0, prefill_t1);
         if (getenv("DS4_METAL_CB_TIMES"))
             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
                     prefill_t0 * 1e3, prefill_t1 * 1e3);
@@ -870,6 +891,7 @@ int main(int argc, char **argv) {
             }
         }
 
+        ar_accounting_snapshot("decode_start");
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
@@ -909,6 +931,8 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            if (gen_done == 0 && getenv("DS4_ARGODRIVE_ACCOUNTING"))
+                fprintf(stderr,"ARGODRIVE_FIRST_TOKEN_READY %.9f %.9f\n",prefill_t0,bench_now_sec());
             const double token_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
             if (gen_done == cuda_profile_start && cudaProfilerStart) {
@@ -982,6 +1006,9 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+        ar_accounting_snapshot("decode_end");
+        if (getenv("DS4_ARGODRIVE_PHASES"))
+            fprintf(stderr, "ARGODRIVE_PHASE decode %.9f %.9f\n", gen_t0, gen_t1);
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {
