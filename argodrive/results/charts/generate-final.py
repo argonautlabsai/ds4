@@ -32,4 +32,6 @@ fig.text(.03,.023,'Engine: antirez/ds4 and contributors. Experimental reader and
 fig.subplots_adjust(left=.30,right=.95,bottom=.25,top=.79)
 fig.savefig(root/'v41-final-matched.svg',metadata={'Date':None})
 fig.savefig(root/'v41-final-matched.png',metadata={'Software':'Matplotlib'})
+svg = root/'v41-final-matched.svg'
+svg.write_text('\n'.join(line.rstrip() for line in svg.read_text().splitlines())+'\n')
 print(dict(zip(variants,values)))
