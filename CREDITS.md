@@ -15,3 +15,8 @@ benchmark tooling at <https://github.com/argonautlabsai/argodrive>.
 
 No model weights, private logs, credentials, or machine-specific configuration
 are part of this fork.
+
+## Development acknowledgements
+
+Claude, ChatGPT and OpenAI Codex assisted with development and review. Their use is acknowledged here; private chat histories are not part of this repository. Performance and correctness claims are supported by the stated tests and measurements, with limitations recorded separately.
+
