@@ -1,0 +1,380 @@
+{
+  "schema": 1,
+  "scope": "Final matched throughput check; measured on one Mac; no general model-quality or portable speed guarantee",
+  "started_at": "2026-09-14T20:07:48.006750+00:00",
+  "finished_at": "2026-09-14T20:19:53.717793+00:00",
+  "fork_commit": "49cfecc22a93529db0d0ce2a92d07e20fa19d46c",
+  "upstream_commit": "bd66c402070042bf0a79ad6ece8242de4c93680c",
+  "compiler": "Apple clang 21.0.0 (clang-2100.1.1.101)",
+  "sdk": "macOS 26.5",
+  "macos": "26.6.2",
+  "model_sha256": "a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e",
+  "prompt_tokens": 512,
+  "generated_tokens": 512,
+  "context_allocation": 4096,
+  "prompt_sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "metric": "generation_tok_s includes first decode step; excludes prefill and startup",
+  "order": [
+    "upstream",
+    "fork-internal",
+    "fork-plus1",
+    "fork-plus2",
+    "fork-plus2",
+    "fork-plus1",
+    "fork-internal",
+    "upstream",
+    "fork-plus1"
+  ],
+  "dashboard_collection": false,
+  "physical_sampler": false,
+  "accounting": false,
+  "cache_policy": "automatic; fresh engine per arm; no OS cache purge",
+  "cache_allocation": "ds4: metal SSD streaming cache target 82.61 GiB; effective 82.61 GiB = 14.24 GiB prefill headroom + 68.37 GiB dynamic cache (3688 experts, 18.98 MiB each)",
+  "engram": "primary SSD only; fork uses eight row readers",
+  "expert_replica_weights": "2 internal; each enclosure 1; full identical replicas",
+  "source_and_binary_identity_checks": "passed before and after campaign",
+  "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563",
+  "all_output_bytes_equal": true,
+  "physical_byte_attribution": "unresolved; not measured in this throughput campaign",
+  "rows": [
+    {
+      "variant": "upstream",
+      "n": 2,
+      "inclusive_tok_s": [
+        10.12,
+        10.01
+      ],
+      "median_inclusive_tok_s": 10.065,
+      "spread_pct": 1.0928961748633823,
+      "steady_tok_s": [
+        10.33,
+        10.19
+      ],
+      "prefill_tok_s": [
+        15.19,
+        15.49
+      ],
+      "output_match": true,
+      "max_swap_growth_mb": 0.0,
+      "gain_vs_upstream_pct": 0.0
+    },
+    {
+      "variant": "fork-internal",
+      "n": 2,
+      "inclusive_tok_s": [
+        12.36,
+        12.28
+      ],
+      "median_inclusive_tok_s": 12.32,
+      "spread_pct": 0.6493506493506499,
+      "steady_tok_s": [
+        12.64,
+        12.55
+      ],
+      "prefill_tok_s": [
+        15.62,
+        15.14
+      ],
+      "output_match": true,
+      "max_swap_growth_mb": 0.0,
+      "gain_vs_upstream_pct": 22.404371584699454
+    },
+    {
+      "variant": "fork-plus1",
+      "n": 3,
+      "inclusive_tok_s": [
+        13.14,
+        13.46,
+        13.65
+      ],
+      "median_inclusive_tok_s": 13.46,
+      "spread_pct": 3.789004457652301,
+      "steady_tok_s": [
+        13.52,
+        13.77,
+        13.98
+      ],
+      "prefill_tok_s": [
+        15.07,
+        15.52,
+        15.63
+      ],
+      "output_match": true,
+      "max_swap_growth_mb": 0.0,
+      "gain_vs_upstream_pct": 33.73075012419275
+    },
+    {
+      "variant": "fork-plus2",
+      "n": 2,
+      "inclusive_tok_s": [
+        14.04,
+        14.17
+      ],
+      "median_inclusive_tok_s": 14.105,
+      "spread_pct": 0.9216589861751208,
+      "steady_tok_s": [
+        14.38,
+        14.52
+      ],
+      "prefill_tok_s": [
+        15.51,
+        15.56
+      ],
+      "output_match": true,
+      "max_swap_growth_mb": 0.0,
+      "gain_vs_upstream_pct": 40.1390958768008
+    }
+  ],
+  "runs": [
+    {
+      "arm": "01-upstream-r1",
+      "variant": "upstream",
+      "repetition": 1,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.19,
+        "generation_tok_s": 10.12,
+        "steady_tokens": 511,
+        "steady_tok_s": 10.33,
+        "first_decode_step_ms": 1095.269,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "02-fork-internal-r1",
+      "variant": "fork-internal",
+      "repetition": 1,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.62,
+        "generation_tok_s": 12.36,
+        "steady_tokens": 511,
+        "steady_tok_s": 12.64,
+        "first_decode_step_ms": 994.302,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "03-fork-plus1-r1",
+      "variant": "fork-plus1",
+      "repetition": 1,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.07,
+        "generation_tok_s": 13.14,
+        "steady_tokens": 511,
+        "steady_tok_s": 13.52,
+        "first_decode_step_ms": 1150.351,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "expert_application_bytes_by_source": {
+          "0": 130813919232,
+          "1": 60448309248
+        },
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "04-fork-plus2-r1",
+      "variant": "fork-plus2",
+      "repetition": 1,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.51,
+        "generation_tok_s": 14.04,
+        "steady_tokens": 511,
+        "steady_tok_s": 14.38,
+        "first_decode_step_ms": 903.141,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "expert_application_bytes_by_source": {
+          "0": 100589764608,
+          "1": 45336231936,
+          "2": 45336231936
+        },
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "05-fork-plus2-r2",
+      "variant": "fork-plus2",
+      "repetition": 2,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.56,
+        "generation_tok_s": 14.17,
+        "steady_tokens": 511,
+        "steady_tok_s": 14.52,
+        "first_decode_step_ms": 918.511,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "expert_application_bytes_by_source": {
+          "0": 100589764608,
+          "1": 45336231936,
+          "2": 45336231936
+        },
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "06-fork-plus1-r2",
+      "variant": "fork-plus1",
+      "repetition": 2,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.52,
+        "generation_tok_s": 13.46,
+        "steady_tokens": 511,
+        "steady_tok_s": 13.77,
+        "first_decode_step_ms": 913.996,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "expert_application_bytes_by_source": {
+          "0": 130813919232,
+          "1": 60448309248
+        },
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "07-fork-internal-r2",
+      "variant": "fork-internal",
+      "repetition": 2,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.14,
+        "generation_tok_s": 12.28,
+        "steady_tokens": 511,
+        "steady_tok_s": 12.55,
+        "first_decode_step_ms": 966.43,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "08-upstream-r2",
+      "variant": "upstream",
+      "repetition": 2,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.49,
+        "generation_tok_s": 10.01,
+        "steady_tokens": 511,
+        "steady_tok_s": 10.19,
+        "first_decode_step_ms": 989.296,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    },
+    {
+      "arm": "09-fork-plus1-r3",
+      "variant": "fork-plus1",
+      "repetition": 3,
+      "result": {
+        "prompt_tokens": 512,
+        "generated_tokens": 512,
+        "prefill_tok_s": 15.63,
+        "generation_tok_s": 13.65,
+        "steady_tokens": 511,
+        "steady_tok_s": 13.98,
+        "first_decode_step_ms": 921.553,
+        "first_response_seconds": null,
+        "engram_read_bytes": null,
+        "expert_read_bytes": null,
+        "rate_source": "ds4-bench CSV: actual engine counts; rounded upstream timers",
+        "quality_verified": false,
+        "publication_ready": false,
+        "expert_application_bytes_by_source": {
+          "0": 130813919232,
+          "1": 60448309248
+        },
+        "output_sha256": "0698ebfb6e99f6d83507ecf23e40dc881f0aba3dd9ce72ae608693daac9be563"
+      },
+      "swap_start_mb": 0.25,
+      "swap_max_mb": 0.25,
+      "output_matches_upstream": true
+    }
+  ],
+  "confirmation_reason": "One-enclosure initial pair spread 2.406%; add one run and retain all observations.",
+  "remaining_limits": [
+    "One performance prompt; bounded correctness checks are separate.",
+    "No new 128-token or broad quality campaign was run.",
+    "No OS cache purge: fresh process does not mean a cold physical-device cache.",
+    "One-enclosure range is 3.8% across three runs; do not imply sub-1% repeatability for it.",
+    "Baseline is pinned upstream commit, not a claim about a later upstream revision."
+  ],
+  "binary_sha256": {
+    "ds4-fresh-clone-validation": "c20d78e1dc605c8567d4fecc23ccda3680793b99cb84f30fa007f58a18649866",
+    "ds4-upstream-validation": "552af0b2f002c32970f15004f1551c1150ed89d001add6e86705ff848a04d728"
+  }
+}

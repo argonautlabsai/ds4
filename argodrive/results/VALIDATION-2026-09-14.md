@@ -1,6 +1,6 @@
-# V4.1 publication gates — 14 September 2026
+# Earlier validation checks — 14 September 2026
 
-**The complete provider is published and freshly cloned successfully. The final 16.3 tok/s claim remains blocked.**
+The complete provider is published and freshly cloned successfully. For the final matched throughput comparison, see [final benchmark results](FINAL-MATCHED-2026-09-14.md). The checks below were recorded before that campaign.
 
 | Gate | Result |
 |---|---|

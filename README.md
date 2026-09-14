@@ -2,7 +2,7 @@
 
 Built on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4), with experimental streaming changes and [ARGODRIVE tooling](https://github.com/argonautlabsai/argodrive). Original licences and upstream acknowledgements are preserved; see [credits](CREDITS.md).
 
-This branch includes the actual expert replica reader and Metal scheduling changes used by the frozen V4.1 experiment. No separate provider library is required. It is pinned to upstream `bd66c402070042bf0a79ad6ece8242de4c93680c`. The earlier `argonaut-v41` branch contains a different GLM integration and is not this benchmark engine.
+This branch includes the actual expert replica reader and Metal scheduling changes used by the V4.1 benchmarks. No separate provider library is required. It is pinned to upstream `bd66c402070042bf0a79ad6ece8242de4c93680c`. The earlier `argonaut-v41` branch contains a different GLM integration and is not this benchmark engine.
 
 ## Try Argodrive on your Mac
 
@@ -26,16 +26,22 @@ Follow [the complete recipe](argodrive/reproduce/README.md) to verify model copi
 
 The reader is implemented in `argodrive_read.h`: complete identical GGUF replicas, 256 KiB block splitting with weights 2:1:1, concurrent reads into disjoint buffer spans, and a completion barrier that rejects partial buffers. Scheduling changes live in `ds4.c`, `ds4_metal.m`, and `metal/moe.metal`. Engram uses eight parallel whole-row readers on the primary SSD. This branch does not implement Engram striping, a learned placement policy, or the GLM expected-completion balancer.
 
-## Measurement status
+## Benchmark results
 
-![Historical pp512/tg512 comparison: three-run medians including the first decode step, with observed ranges](argodrive/results/charts/v41-historical-inclusive.png)
+**14.11 tok/s with internal storage and two SSD enclosures — 40.1% faster than upstream ds4 on internal storage.**
 
-This chart uses the **historical frozen campaign**, not today's rebuild. [Source values](argodrive/results/frozen-summary.json) · [Chart generator](argodrive/results/charts/generate.py) · [Fresh-clone validation](argodrive/results/VALIDATION-2026-09-14.md). All four bars use the same prompt/output lengths and inclusive metric.
+![DeepSeek V4.1 Flash Q4: final matched generation speeds and observed ranges](argodrive/results/charts/v41-final-matched.png)
 
+| Configuration | Median tok/s | Measured range | Gain vs upstream |
+|---|---:|---:|---:|
+| Upstream ds4 — internal | 10.07 | 10.01–10.12 | Baseline |
+| Our fork — internal | 12.32 | 12.28–12.36 | +22.4% |
+| Our fork — internal + one enclosure | 13.46 | 13.14–13.65 | +33.7% |
+| Our fork — internal + two enclosures | 14.11 | 14.04–14.17 | +40.1% |
 
-**16.31 tok/s is a historical steady-decode maximum at pp512/tg128, excluding the first decode step. The same arm was 14.70 tok/s including that step.** It is not a guaranteed result or a final publication claim. The three historical pp512/tg512 runs were 15.49–15.56 tok/s including the first step. See [the metric table](argodrive/results/frozen-summary.json).
+Measured on an **M5 Max, 128 GiB, DeepSeek V4.1 Flash Q4**, using the same **512-token prompt and 512 generated tokens**. Rates include the first decode step and exclude prefill and startup. Two runs per configuration, plus a third one-enclosure check; all nine outputs were byte-identical, with no swap growth. Dashboard collection was off. Expert reads use the configured SSD replicas; Engram stays on internal storage.
 
-Fresh-clone execution and bounded upstream output comparisons passed with clang21/macOS26.5. Client first-content times are captured. Application counters close, but physical byte attribution still has an unexplained residual. [Current validation and open gates](argodrive/results/VALIDATION-2026-09-14.md) record 14.00 tok/s inclusive / 15.45 steady from the fresh accounting-off arm. Results use one raw completion prompt; task quality and chat timing are separate. See [credits](CREDITS.md) for attribution. CUDA and distributed execution of these additions are unqualified.
+[**Test details and reproduction**](argodrive/results/FINAL-MATCHED-2026-09-14.md) · [**Measured data**](argodrive/results/final-matched-2026-09-14.json) · [Chart source](argodrive/results/charts/generate-final.py)
 
 ---
 
