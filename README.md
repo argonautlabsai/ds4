@@ -14,6 +14,11 @@ deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
 
+**ARGODRIVE DS4 fork.** This branch contains experimental, opt-in hooks for
+[Argodrive](https://github.com/argonautlabsai/argodrive) expert streaming. The
+normal build remains local-only; the hooks are inert unless an external
+provider is explicitly configured.
+
 We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
