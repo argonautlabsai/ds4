@@ -8,7 +8,7 @@ The full model is **518,596,067,328 bytes**, SHA-256 **a5e2e2c3ada4b2e98d9f9e4b5
 
 On the `argonaut-v41-benchmark` branch, `make -j4 ds4 ds4-bench ds4-server` builds the real reader directly. Paths below are relative to `argodrive/`. The legacy `build.py` recipe rebuilds the frozen source; for new phase accounting use this branch build.
 
-From the pack directory, with Xcode command-line tools and Python 3 available:
+From the pack directory, with Xcode and Python 3 available. Pin the per-shell toolchain first (`export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`); the frozen campaign used Apple clang 21 and macOS 26.5 SDK. Record `xcrun clang --version` and `xcrun --show-sdk-path`. Older Command Line Tools can produce different greedy output:
 
 ```sh
 python3 reproduce/build.py --variant upstream --checkout /path/to/upstream

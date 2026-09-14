@@ -9,7 +9,11 @@ This branch includes the actual expert replica reader and Metal scheduling chang
 ```sh
 git clone --branch argonaut-v41-benchmark https://github.com/argonautlabsai/ds4.git
 cd ds4
-make -j4 ds4 ds4-bench ds4-server
+# Match the recorded compiler/SDK; do not rely on an older selected CLT.
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+xcrun clang --version
+make -j4 CC="$(xcrun --find clang)" ds4 ds4-bench ds4-server
 ```
 
 Follow [the complete recipe](argodrive/reproduce/README.md) to verify model copies and run internal-only, one-enclosure and two-enclosure configurations. The recipe includes a pinned upstream control, physical disk sampler, output comparison and sanitizer fixtures. Model files are not included.
