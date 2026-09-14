@@ -1,0 +1,20 @@
+--- a/ds4_bench.c
++++ b/ds4_bench.c
+@@ -833,6 +833,8 @@
+         }
+         const double prefill_t1 = bench_now_sec();
+         const double prefill_sec = prefill_t1 - prefill_t0;
++        if (getenv("DS4_ARGODRIVE_PHASES"))
++            fprintf(stderr,"ARGODRIVE_PHASE prefill %.9f %.9f\n",prefill_t0,prefill_t1);
+         if (getenv("DS4_METAL_CB_TIMES"))
+             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
+                     prefill_t0 * 1e3, prefill_t1 * 1e3);
+@@ -982,6 +984,8 @@
+             }
+         }
+         const double gen_t1 = bench_now_sec();
++        if (getenv("DS4_ARGODRIVE_PHASES"))
++            fprintf(stderr,"ARGODRIVE_PHASE decode %.9f %.9f\n",gen_t0,gen_t1);
+         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
+             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
+             for (int i = 0; i < gen_token_count; i++) {
