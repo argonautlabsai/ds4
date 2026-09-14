@@ -108,6 +108,16 @@ Leave memory for the context and runtime buffers as well as the model.
 See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
 on a smaller Mac.
 
+### Optional Argodrive expert transport
+
+This branch carries an opt-in Metal hook for Argodrive, a separate project that
+can serve byte-identical expert records from additional local or network tiers.
+The hook is dormant in a normal build: no transport library, endpoint, secret,
+or model data is bundled here, and the local read path remains the fallback.
+An external provider must verify every response before returning success. The
+transport prototype is documented in the Argodrive repository and is not a
+claim of RDMA support or a token-speed result.
+
 ## Everyday Use
 
 Once built and with a model downloaded:

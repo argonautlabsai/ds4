@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Build DwarfStar's asymmetric Q2 GGUF for the full GLM-5.3 model."""
+"""Build DwarfStar's asymmetric Q2 GGUF for the full GLM-5.3 model.
+
+Local option (GLM53 project, not upstream): --routed q4 builds the uniform
+Q4_K routed layout (gate/up/down Q4_K in every routed layer, MTP block
+included) that ds4's Metal streaming expert cache accepts; trunk stays Q8_0."""
 
 from __future__ import annotations
 
@@ -110,7 +114,7 @@ def add_attention(plan, db, layer, indexer_types):
     )
 
 
-def add_ffn(plan, db, layer, provisional_q2k=False):
+def add_ffn(plan, db, layer, provisional_q2k=False, routed="iq2"):
     prefix = f"{source_prefix(layer)}.mlp"
     if layer < 3:
         for part in ("gate", "up", "down"):
@@ -140,11 +144,14 @@ def add_ffn(plan, db, layer, provisional_q2k=False):
         q.QTYPE_F32,
         "router",
     )
-    expert_qtype = (
-        q.QTYPE_Q2_K
-        if provisional_q2k or layer == MTP_BLOCK
-        else q.QTYPE_IQ2_XXS
-    )
+    if routed == "q4":
+        expert_qtype = q.QTYPE_Q4_K
+    else:
+        expert_qtype = (
+            q.QTYPE_Q2_K
+            if provisional_q2k or layer == MTP_BLOCK
+            else q.QTYPE_IQ2_XXS
+        )
     for part in ("gate", "up", "down"):
         add_experts(plan, db, layer, part, expert_qtype)
     for part in ("gate", "up", "down"):
@@ -158,7 +165,7 @@ def add_ffn(plan, db, layer, provisional_q2k=False):
         )
 
 
-def build_plan(db, config, provisional_q2k=False):
+def build_plan(db, config, provisional_q2k=False, routed="iq2"):
     plan = []
     q.add_regular(plan, db, "token_embd.weight", "model.embed_tokens.weight", q.QTYPE_Q8_0, "embedding")
     indexer_types = config["indexer_types"]
@@ -184,7 +191,7 @@ def build_plan(db, config, provisional_q2k=False):
             q.QTYPE_F32,
             "norm",
         )
-        add_ffn(plan, db, layer, provisional_q2k)
+        add_ffn(plan, db, layer, provisional_q2k, routed)
         if layer == MTP_BLOCK:
             q.add_regular(
                 plan,
@@ -281,6 +288,12 @@ def parse_args():
         action="store_true",
         help="use Q2_K for every routed expert to build a fast calibration model",
     )
+    parser.add_argument(
+        "--routed",
+        choices=("iq2", "q4"),
+        default="iq2",
+        help="routed expert layout: iq2 = upstream asymmetric Q2 (default); q4 = uniform Q4_K gate/up/down",
+    )
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--source-revision", default="e0b07fd2751b42d5efa199cc02c2b271deadc516")
     parser.add_argument("--quants-library", help="path to libds4quants")
@@ -292,6 +305,10 @@ def parse_args():
         parser.error("--threads must be between 1 and 64")
     if not args.dry_run and not args.out:
         parser.error("--out is required unless --dry-run is used")
+    if args.routed == "q4" and args.provisional_q2k:
+        parser.error("--provisional-q2k applies to the iq2 layout only")
+    if args.routed == "q4" and args.imatrix:
+        print("glm53-full-quantize: using the imatrix for Q4_K expert scale selection", file=sys.stderr)
     return args
 
 
@@ -303,7 +320,7 @@ def main():
         q.fail(f"unexpected architecture: {config.get('architectures')!r}")
     db = q.SourceDB(args.hf, validate_glm53_full_index)
     try:
-        plan = build_plan(db, config, args.provisional_q2k)
+        plan = build_plan(db, config, args.provisional_q2k, args.routed)
         tokenizer_records, template_tokens = q.load_tokenizer_records(args.tokenizer_template)
         q.validate_tokenizer_template(args.hf, template_tokens, 154880)
         kv_records = model_metadata(args.hf, args.source_revision)

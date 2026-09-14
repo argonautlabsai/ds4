@@ -5262,8 +5262,20 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
      * cap: crossing too close to the recommended working set makes short
      * token-major prefill spend most of its time in VM/driver synchronization.
      */
-    uint64_t target = recommended > UINT64_MAX / 7ull ?
-        UINT64_MAX : (recommended * 7ull) / 8ull;
+    /* GLM53 00:00: the 7/8 cap fraction is overridable for cache-size arms
+     * (DS4_SSD_CACHE_CAP_FRACTION, default 0.875, accepted 0.5..1.2). */
+    double cap_frac = 7.0 / 8.0;
+    {
+        const char *cf = getenv("DS4_SSD_CACHE_CAP_FRACTION");
+        if (cf && *cf) {
+            const double v = atof(cf);
+            if (v >= 0.5 && v <= 1.2) {
+                cap_frac = v;
+                fprintf(stderr, "ds4: SSD streaming explicit cache cap fraction overridden to %.3f\n", v);
+            }
+        }
+    }
+    uint64_t target = (uint64_t)((double)recommended * cap_frac);
     const ds4_context_memory ctx_mem =
         ds4_context_memory_estimate_with_prefill_mode(backend,
                                                       ctx_size,
@@ -39030,7 +39042,17 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
 #define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
 #define DS4_GLM53_INDEX_POOL_SIZE 4u
-#define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
+static uint32_t ds4_glm53_prefill_chunk_tokens(void) {   /* GLM53 06:15: env override of the 2048-token GLM-5.3 prefill chunk */
+    static int checked = 0; static uint32_t v = 2048u;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("DS4_GLM53_PREFILL_CHUNK");
+        if (e && atoi(e) > 0) { long n = atoi(e); if (n < 256) n = 256; if (n > 4096) n = 4096; v = (uint32_t)n;
+            fprintf(stderr, "ds4: GLM-5.3 prefill chunk overridden to %u tokens\n", v); }
+    }
+    return v;
+}
+#define DS4_GLM53_PREFILL_CHUNK_TOKENS (ds4_glm53_prefill_chunk_tokens())
 
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
                                              bool     ssd_streaming);
@@ -48869,6 +48891,246 @@ static bool glm_graph_encode_shared_swiglu_one(
     return ok;
 }
 
+/* GLM53 01:05 router-lookahead probe (diagnostic): evaluate layer il+1's router on layer il's
+ * pre-MoE normalized hidden state and score the top-k overlap with il+1's real routing. */
+static FILE *glm_route_dump_file;
+static uint64_t glm_route_dump_step;
+static uint32_t glm_route_dump_last_layer = UINT32_MAX;
+static void glm_route_dump(uint32_t il, const int32_t *ids) {
+    static int checked = 0;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("DS4_GLM_ROUTE_DUMP");
+        if (e && *e) { glm_route_dump_file = fopen(e, "a"); if (glm_route_dump_file) fprintf(glm_route_dump_file, "step,layer,ids\n"); }
+    }
+    if (!glm_route_dump_file) return;
+    if (il <= glm_route_dump_last_layer) glm_route_dump_step++;   /* layer index wrapped → next decode step */
+    glm_route_dump_last_layer = il;
+    fprintf(glm_route_dump_file, "%llu,%u", (unsigned long long)glm_route_dump_step, il);
+    for (uint32_t a = 0; a < DS4_N_EXPERT_USED; a++) fprintf(glm_route_dump_file, ",%d", ids[a]);
+    fputc('\n', glm_route_dump_file);
+}
+static int glm_router_lookahead_probe_enabled(void) {
+    static int checked = 0, on = 0;
+    if (!checked) { const char *e = getenv("DS4_GLM_ROUTER_LOOKAHEAD_PROBE"); on = (e && strcmp(e, "0") != 0); checked = 1; }
+    return on;
+}
+static ds4_gpu_tensor *g_la_logits, *g_la_probs, *g_la_selected, *g_la_weights;
+static int32_t  g_la_pred[DS4_MAX_LAYER][DS4_MAX_EXPERT_USED];
+static uint8_t  g_la_pred_valid[DS4_MAX_LAYER];
+static uint64_t g_la_layers, g_la_hits, g_la_hist[DS4_MAX_EXPERT_USED + 1];
+static uint64_t g_la_layer_n[DS4_MAX_LAYER], g_la_layer_hits[DS4_MAX_LAYER];
+/* refinement 3: L+1's own norm; refinement 4 probe: depth-2 prediction */
+static ds4_gpu_tensor *g_la_norm, *g_la2_logits, *g_la2_probs, *g_la2_selected, *g_la2_weights;
+static int32_t  g_la2_pred[DS4_MAX_LAYER][DS4_MAX_EXPERT_USED];
+static uint8_t  g_la2_pred_valid[DS4_MAX_LAYER];
+static uint64_t g_la2_layers, g_la2_hits, g_la2_hist[DS4_MAX_EXPERT_USED + 1];
+static int glm_router_lookahead_norm_on(void) {
+    static int checked = 0, on = 0;
+    if (!checked) { const char *e = getenv("DS4_GLM_ROUTER_LOOKAHEAD_NORM"); on = (e && strcmp(e, "0") != 0); checked = 1; }
+    return on;
+}
+static int glm_router_lookahead_probe_depth2(void) {
+    static int checked = 0, on = 0;
+    if (!checked) { const char *e = getenv("DS4_GLM_ROUTER_LOOKAHEAD_PROBE_DEPTH"); on = (e && atoi(e) >= 2); checked = 1; }
+    return on;
+}
+/* router input for predicting layer `target` from the current layer's tensors */
+static const ds4_gpu_tensor *glm_router_lookahead_input(
+        ds4_glm_gpu_graph *g, const ds4_model *model, uint32_t target,
+        const ds4_gpu_tensor *ffn_norm, const ds4_gpu_tensor *after_attn) {
+    if (!glm_router_lookahead_norm_on() || !after_attn || !g->weights) return ffn_norm;
+    const ds4_layer_weights *lt = &g->weights->layer[target];
+    if (!lt->ffn_norm) return ffn_norm;
+    if (!g_la_norm) {
+        g_la_norm = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (!g_la_norm) return ffn_norm;
+    }
+    if (ds4_gpu_rms_norm_weight_tensor(g_la_norm, after_attn, model->map, model->size,
+                                       lt->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS) == 0) return ffn_norm;
+    return g_la_norm;
+}
+static void glm_router_lookahead_probe_report(void) {
+    if (!g_la_layers) return;
+    fprintf(stderr, "ds4: router lookahead probe: layers=%llu mean_overlap=%.2f/%u hist=",
+            (unsigned long long)g_la_layers, (double)g_la_hits / (double)g_la_layers, (unsigned)DS4_N_EXPERT_USED);
+    for (uint32_t k = 0; k <= DS4_N_EXPERT_USED && k <= DS4_MAX_EXPERT_USED; k++)
+        fprintf(stderr, "%s%llu", k ? "," : "", (unsigned long long)g_la_hist[k]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "ds4: router lookahead probe per layer (mean overlap):");
+    for (uint32_t il = 0; il < DS4_N_LAYER && il < DS4_MAX_LAYER; il++)
+        if (g_la_layer_n[il]) fprintf(stderr, " %u:%.1f", il, (double)g_la_layer_hits[il] / (double)g_la_layer_n[il]);
+    fprintf(stderr, "\n");
+    if (g_la2_layers) {
+        fprintf(stderr, "ds4: router lookahead probe depth2: layers=%llu mean_overlap=%.2f/%u hist=",
+                (unsigned long long)g_la2_layers, (double)g_la2_hits / (double)g_la2_layers, (unsigned)DS4_N_EXPERT_USED);
+        for (uint32_t k = 0; k <= DS4_N_EXPERT_USED && k <= DS4_MAX_EXPERT_USED; k++)
+            fprintf(stderr, "%s%llu", k ? "," : "", (unsigned long long)g_la2_hist[k]);
+        fprintf(stderr, "\n");
+    }
+}
+static bool glm_router_lookahead_probe(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        uint32_t                 il,
+        const ds4_gpu_tensor    *ffn_norm,
+        const ds4_gpu_tensor    *after_attn) {
+    static int registered = 0;
+    if (!registered) { atexit(glm_router_lookahead_probe_report); registered = 1; }
+    if (il >= DS4_MAX_LAYER) return true;
+    /* 1) score the prediction made at layer il-1 against il's real routing */
+    if (g_la_pred_valid[il]) {
+        if (ds4_gpu_end_commands() == 0) return false;
+        int32_t real[DS4_MAX_EXPERT_USED] = {0};
+        const bool rd = ds4_gpu_tensor_read(g->router_selected, 0, real,
+                                            (uint64_t)DS4_N_EXPERT_USED * sizeof(real[0])) != 0;
+        if (ds4_gpu_begin_commands() == 0) return false;
+        if (rd) {
+            glm_route_dump(il, real);
+            uint32_t hit = 0;
+            for (uint32_t a = 0; a < DS4_N_EXPERT_USED; a++)
+                for (uint32_t b = 0; b < DS4_N_EXPERT_USED; b++)
+                    if (real[a] == g_la_pred[il][b]) { hit++; break; }
+            g_la_layers++; g_la_hits += hit;
+            g_la_hist[hit > DS4_MAX_EXPERT_USED ? DS4_MAX_EXPERT_USED : hit]++;
+            g_la_layer_n[il]++; g_la_layer_hits[il] += hit;
+        }
+        g_la_pred_valid[il] = 0;
+    }
+    if (g_la2_pred_valid[il]) {
+        if (ds4_gpu_end_commands() == 0) return false;
+        int32_t real[DS4_MAX_EXPERT_USED] = {0};
+        const bool rd = ds4_gpu_tensor_read(g->router_selected, 0, real,
+                                            (uint64_t)DS4_N_EXPERT_USED * sizeof(real[0])) != 0;
+        if (ds4_gpu_begin_commands() == 0) return false;
+        if (rd) {
+            uint32_t hit = 0;
+            for (uint32_t a = 0; a < DS4_N_EXPERT_USED; a++)
+                for (uint32_t b = 0; b < DS4_N_EXPERT_USED; b++)
+                    if (real[a] == g_la2_pred[il][b]) { hit++; break; }
+            g_la2_layers++; g_la2_hits += hit; g_la2_hist[hit > DS4_MAX_EXPERT_USED ? DS4_MAX_EXPERT_USED : hit]++;
+        }
+        g_la2_pred_valid[il] = 0;
+    }
+    /* 2) predict layer il+1's routing from il's pre-MoE hidden state */
+    if (il + 1 >= DS4_N_LAYER || il + 1 >= DS4_MAX_LAYER || !g->weights) return true;
+    const ds4_layer_weights *ln = &g->weights->layer[il + 1];
+    if (!ln->ffn_gate_inp || !ln->ffn_exp_probs_b || !ln->ffn_gate_exps) return true;
+    const ds4_gpu_tensor *la_in = glm_router_lookahead_input(g, model, il + 1, ffn_norm, after_attn);
+    if (!g_la_logits) {
+        g_la_logits   = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_probs    = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_selected = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_la_weights  = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (!g_la_logits || !g_la_probs || !g_la_selected || !g_la_weights) return true;
+    }
+    bool ok = ds4_gpu_matmul_f32_tensor(g_la_logits, model->map, model->size,
+                                        ln->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, la_in, 1) != 0;
+    if (ok) ok = ds4_gpu_glm_router_select_tensor(g_la_selected, g_la_weights, g_la_probs, model->map, model->size,
+                                                  ln->ffn_exp_probs_b->abs_offset, g_la_logits,
+                                                  DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+    if (!ok) return true;   /* a probe failure must not break decode */
+    /* depth 2: layer il+2 from the same input (its own norm when NORM is on) */
+    bool ok2 = false;
+    if (glm_router_lookahead_probe_depth2() && il + 2 < DS4_N_LAYER && il + 2 < DS4_MAX_LAYER) {
+        const ds4_layer_weights *l2 = &g->weights->layer[il + 2];
+        if (l2->ffn_gate_inp && l2->ffn_exp_probs_b && l2->ffn_gate_exps) {
+            if (!g_la2_logits) {
+                g_la2_logits   = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+                g_la2_probs    = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+                g_la2_selected = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+                g_la2_weights  = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+            }
+            if (g_la2_logits && g_la2_probs && g_la2_selected && g_la2_weights) {
+                const ds4_gpu_tensor *la2_in = glm_router_lookahead_input(g, model, il + 2, ffn_norm, after_attn);
+                ok2 = ds4_gpu_matmul_f32_tensor(g_la2_logits, model->map, model->size,
+                                                l2->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, la2_in, 1) != 0;
+                if (ok2) ok2 = ds4_gpu_glm_router_select_tensor(g_la2_selected, g_la2_weights, g_la2_probs, model->map, model->size,
+                                                                l2->ffn_exp_probs_b->abs_offset, g_la2_logits,
+                                                                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+            }
+        }
+    }
+    if (ds4_gpu_end_commands() == 0) return false;
+    const bool rd = ds4_gpu_tensor_read(g_la_selected, 0, g_la_pred[il + 1],
+                                        (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) != 0;
+    bool rd2 = false;
+    if (ok2) rd2 = ds4_gpu_tensor_read(g_la2_selected, 0, g_la2_pred[il + 2],
+                                       (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) != 0;
+    if (ds4_gpu_begin_commands() == 0) return false;
+    g_la_pred_valid[il + 1] = rd ? 1 : 0;
+    if (ok2) g_la2_pred_valid[il + 2] = rd2 ? 1 : 0;
+    return true;
+}
+
+/* GLM53 01:20 router-lookahead PREFETCH: encode layer il+1's router on il's pre-MoE hidden state
+ * inside the current command batch (no sync) and publish it to the Metal streaming side. */
+void ds4_gpu_glm_lookahead_publish(const ds4_gpu_tensor *selected, uint32_t layer,
+                                   uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset);
+void ds4_gpu_glm_lookahead_publish_scores(const ds4_gpu_tensor *probs, const float *bias);   /* GLM53 lever #2 */
+void ds4_gpu_glm_lookahead_publish2(const ds4_gpu_tensor *selected, uint32_t layer,
+                                    uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset);
+static uint32_t glm_router_lookahead_prefetch_k2(void) {
+    static int checked = 0; static uint32_t k = 0;
+    if (!checked) { const char *e = getenv("DS4_GLM_ROUTER_LOOKAHEAD_PREFETCH2"); if (e && atoi(e) > 0) k = (uint32_t)atoi(e); checked = 1; }
+    return k;
+}
+static uint32_t glm_router_lookahead_prefetch_k(void) {
+    static int checked = 0; static uint32_t k = 0;
+    if (!checked) { const char *e = getenv("DS4_GLM_ROUTER_LOOKAHEAD_PREFETCH"); if (e && atoi(e) > 0) k = (uint32_t)atoi(e); checked = 1; }
+    return k;
+}
+static bool glm_router_lookahead_encode(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        uint32_t                 il,
+        const ds4_gpu_tensor    *ffn_norm,
+        const ds4_gpu_tensor    *after_attn) {
+    if (il + 1 >= DS4_N_LAYER || il + 1 >= DS4_MAX_LAYER || !g->weights) return true;
+    const ds4_layer_weights *ln = &g->weights->layer[il + 1];
+    if (!ln->ffn_gate_inp || !ln->ffn_exp_probs_b || !ln->ffn_gate_exps || !ln->ffn_up_exps || !ln->ffn_down_exps) return true;
+    if (!g_la_logits) {
+        g_la_logits   = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_probs    = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_selected = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_la_weights  = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (!g_la_logits || !g_la_probs || !g_la_selected || !g_la_weights) return true;
+    }
+    const ds4_gpu_tensor *la_in = glm_router_lookahead_input(g, model, il + 1, ffn_norm, after_attn);
+    bool ok = ds4_gpu_matmul_f32_tensor(g_la_logits, model->map, model->size,
+                                        ln->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, la_in, 1) != 0;
+    if (ok) ok = ds4_gpu_glm_router_select_tensor(g_la_selected, g_la_weights, g_la_probs, model->map, model->size,
+                                                  ln->ffn_exp_probs_b->abs_offset, g_la_logits,
+                                                  DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+    if (!ok) return true;   /* lookahead failure must not break decode */
+    ds4_gpu_glm_lookahead_publish(g_la_selected, il + 1,
+                                  ln->ffn_gate_exps->abs_offset, ln->ffn_up_exps->abs_offset, ln->ffn_down_exps->abs_offset);
+    ds4_gpu_glm_lookahead_publish_scores(g_la_probs,
+                                         (const float *)((const uint8_t *)model->map + ln->ffn_exp_probs_b->abs_offset));
+    if (glm_router_lookahead_prefetch_k2() > 0 && il + 2 < DS4_N_LAYER && il + 2 < DS4_MAX_LAYER) {
+        const ds4_layer_weights *l2 = &g->weights->layer[il + 2];
+        if (l2->ffn_gate_inp && l2->ffn_exp_probs_b && l2->ffn_gate_exps && l2->ffn_up_exps && l2->ffn_down_exps) {
+            if (!g_la2_logits) {
+                g_la2_logits   = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+                g_la2_probs    = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT * sizeof(float));
+                g_la2_selected = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+                g_la2_weights  = ds4_gpu_tensor_alloc_ptr_on(0, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+            }
+            if (g_la2_logits && g_la2_probs && g_la2_selected && g_la2_weights) {
+                const ds4_gpu_tensor *la2_in = glm_router_lookahead_input(g, model, il + 2, ffn_norm, after_attn);
+                bool ok2 = ds4_gpu_matmul_f32_tensor(g_la2_logits, model->map, model->size,
+                                                     l2->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, la2_in, 1) != 0;
+                if (ok2) ok2 = ds4_gpu_glm_router_select_tensor(g_la2_selected, g_la2_weights, g_la2_probs, model->map, model->size,
+                                                                l2->ffn_exp_probs_b->abs_offset, g_la2_logits,
+                                                                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+                if (ok2) ds4_gpu_glm_lookahead_publish2(g_la2_selected, il + 2,
+                                                        l2->ffn_gate_exps->abs_offset, l2->ffn_up_exps->abs_offset, l2->ffn_down_exps->abs_offset);
+            }
+        }
+    }
+    return true;
+}
+
 static bool glm_graph_encode_sparse_ffn_one(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -48923,6 +49185,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          1,
                                          stage_t0);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
+    if (ok && glm_router_lookahead_probe_enabled()) ok = glm_router_lookahead_probe(g, model, il, ffn_norm, after_attn);
+    if (ok && glm_router_lookahead_prefetch_k() > 0) ok = glm_router_lookahead_encode(g, model, il, ffn_norm, after_attn);
     const bool resident_decode_layer =
         g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
     const bool streaming_expert_cache =
@@ -57098,6 +57362,10 @@ static DS4_MAYBE_UNUSED int generate_glm_metal_first_token(
     return 0;
 }
 
+/* GLM53: optional Argodrive per-request timing labels (weak: absent in builds without the adapter). */
+extern void argodrive_glm_mark(uint32_t phase, uint32_t step) __attribute__((weak_import));
+#define DS4_ARGO_MARK(p, s) do { if (argodrive_glm_mark) argodrive_glm_mark((uint32_t)(p), (uint32_t)(s)); } while (0)
+
 static int generate_glm_metal_argmax(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
@@ -57178,6 +57446,7 @@ static int generate_glm_metal_argmax(
                                                                   weights);
     }
     if (ok) {
+        DS4_ARGO_MARK(1, 0);
         ok = glm_graph_prefill_range(&g,
                                      model,
                                      weights,
@@ -57191,24 +57460,32 @@ static int generate_glm_metal_argmax(
     }
     const double t_prefill1 = now_sec();
     if (memory_report) ds4_gpu_print_memory_report("after GLM prefill");
+    DS4_ARGO_MARK(2, 0);
     if (!ok) {
         fprintf(stderr, "ds4: GLM prefill failed\n");
         free(logits);
         glm_graph_free(&g);
         return 1;
     }
-#ifdef DS4_ROCM_BUILD
+#if 1
     /*
      * Decode is SSD-read bound, so the prefill expert headroom is worth more
-     * as extra dynamic cache once prefill is done.  Opt out with
-     * DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL=0.
+     * as extra dynamic cache once prefill is done.  ROCm: on unless
+     * DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL=0.  Metal (GLM53 port,
+     * 06:45): opt-in with DS4_METAL_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL=1.
      */
     const char *grow_cache_env =
         getenv("DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
+#ifdef DS4_ROCM_BUILD
+    const bool grow_cache_on = grow_cache_env == NULL || glm_graph_env_truthy(grow_cache_env);
+#else
+    if (grow_cache_env == NULL) grow_cache_env = getenv("DS4_METAL_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
+    const bool grow_cache_on = grow_cache_env != NULL && glm_graph_env_truthy(grow_cache_env);
+#endif
     if (ssd_streaming &&
         ssd_streaming_cache_bytes != 0 &&
         ssd_streaming_prefill_headroom_bytes != 0 &&
-        (grow_cache_env == NULL || glm_graph_env_truthy(grow_cache_env))) {
+        grow_cache_on) {
         uint64_t budget_bytes = 0;
         uint64_t per_expert_bytes = 0;
         if (ssd_streaming_cache_bytes <=
@@ -57225,7 +57502,7 @@ static int generate_glm_metal_argmax(
         if (grown_budget > current_budget) {
             ds4_gpu_set_streaming_expert_cache_budget(grown_budget);
             fprintf(stderr,
-                    "ds4: ROCm GLM streaming expert cache grew after prefill: "
+                    "ds4: GLM streaming expert cache grew after prefill: "
                     "%u -> %u experts (%.2f GiB)\n",
                     current_budget,
                     grown_budget,
@@ -57233,10 +57510,11 @@ static int generate_glm_metal_argmax(
                         1073741824.0);
         }
     }
-#else
-    (void)ssd_streaming_cache_bytes;
-    (void)ssd_streaming_prefill_headroom_bytes;
 #endif
+    if (ssd_streaming && getenv("DS4_GLM_FLUSH_CACHE_AFTER_PREFILL") != NULL) {
+        extern void ds4_gpu_stream_expert_cache_flush_after_prefill(void);   /* GLM53 isolation test hook */
+        ds4_gpu_stream_expert_cache_flush_after_prefill();
+    }
 
     int n_generated = 0;
     int n_decode_eval = 0;
@@ -57260,6 +57538,7 @@ static int generate_glm_metal_argmax(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        DS4_ARGO_MARK(2, n_decode_eval + 1);
         ok = glm_graph_forward_token(&g, model, weights, token, NULL, pos,
                                      NULL, logits, false);
         if (!ok) {
@@ -59079,6 +59358,7 @@ static int generate_metal_graph_raw_swa(
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
+    DS4_ARGO_MARK(1, 0);
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt,
@@ -59094,6 +59374,7 @@ static int generate_metal_graph_raw_swa(
     }
     const double t_prefill1 = now_sec();
     if (memory_report) ds4_gpu_print_memory_report("after prefill");
+    DS4_ARGO_MARK(2, 0);
 
     if (!ok) {
         free(logits);
@@ -59133,6 +59414,7 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        DS4_ARGO_MARK(2, n_decode_eval + 1);
         ok = metal_graph_eval_token_raw_swa(&g,
                                             model,
                                             weights,
