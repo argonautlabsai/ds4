@@ -1,8 +1,14 @@
 # Argodrive DeepSeek V4.1 benchmark engine
 
-Built with [ARGODRIVE](https://github.com/argonautlabsai/argodrive), based on [antirez/ds4](https://github.com/antirez/ds4).
+Built on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4), with experimental streaming changes and [ARGODRIVE tooling](https://github.com/argonautlabsai/argodrive). Original licences and upstream acknowledgements are preserved; see [credits](CREDITS.md).
 
 This branch includes the actual expert replica reader and Metal scheduling changes used by the frozen V4.1 experiment. No separate provider library is required. It is pinned to upstream `bd66c402070042bf0a79ad6ece8242de4c93680c`. The earlier `argonaut-v41` branch contains a different GLM integration and is not this benchmark engine.
+
+## Try Argodrive on your Mac
+
+[**Download the Apple-silicon beta**](https://github.com/argonautlabsai/argodrive/releases/tag/v0.2.0-beta.3) · [**Testing guide**](https://github.com/argonautlabsai/argodrive/blob/beta-20260914/docs/BETA-TESTING.md) · [**Argodrive GitHub**](https://github.com/argonautlabsai/argodrive)
+
+The beta provides live drive charts and saved-run comparison. Install it, open Live Hardware, and choose a folder containing supported benchmark runs to inspect and compare them. Engine benchmarks use the recipe below; the app is not a one-click speed optimizer. The beta is ad-hoc signed and not notarized; model files are separate. [Report testing feedback](https://github.com/argonautlabsai/argodrive/issues).
 
 ## Build and reproduce
 
@@ -22,11 +28,18 @@ The reader is implemented in `argodrive_read.h`: complete identical GGUF replica
 
 ## Measurement status
 
+![Historical pp512/tg512 comparison: three-run medians including the first decode step, with observed ranges](argodrive/results/charts/v41-historical-inclusive.png)
+
+This chart uses the **historical frozen campaign**, not today's rebuild. [Source values](argodrive/results/frozen-summary.json) · [Chart generator](argodrive/results/charts/generate.py) · [Fresh-clone validation](argodrive/results/VALIDATION-2026-09-14.md). All four bars use the same prompt/output lengths and inclusive metric.
+
+
 **16.31 tok/s is a historical steady-decode maximum at pp512/tg128, excluding the first decode step. The same arm was 14.70 tok/s including that step.** It is not a guaranteed result or a final publication claim. The three historical pp512/tg512 runs were 15.49–15.56 tok/s including the first step. See [the metric table](argodrive/results/frozen-summary.json).
 
 Fresh-clone execution and bounded upstream output comparisons passed with clang21/macOS26.5. Client first-content times are captured. Application counters close, but physical byte attribution still has an unexplained residual. [Current validation and open gates](argodrive/results/VALIDATION-2026-09-14.md) record 14.00 tok/s inclusive / 15.45 steady from the fresh accounting-off arm. Results use one raw completion prompt; task quality and chat timing are separate. See [credits](CREDITS.md) for attribution. CUDA and distributed execution of these additions are unqualified.
 
 ---
+
+## Upstream ds4 documentation (preserved)
 
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
