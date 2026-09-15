@@ -13002,7 +13002,12 @@ static int ar_prefill_ranges_valid(const void *map, uint64_t size, const uint64_
             (unsigned long long)size,(unsigned long long)g_argodrive_reader.size);
         return 0;
     }
-    if (g_argodrive_reader.invalid || g_argodrive_reader.count<2) {
+    /* One source is legitimate. Staging exists for two reasons and only the
+     * first needs several drives: splitting a read across replicas, and reading
+     * only the experts the chunk actually routed to. The second removes about
+     * half the prefill bytes on any machine, so gating it behind count>=2 hid
+     * the portable win from every single-drive user. */
+    if (g_argodrive_reader.invalid || g_argodrive_reader.count<1) {
         if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: reader invalid=%d sources=%u\n",
             g_argodrive_reader.invalid,g_argodrive_reader.count);
         return 0;
