@@ -1,4 +1,4 @@
-> **V4.1 benchmark source:** use [`argonaut-v41-benchmark`](https://github.com/argonautlabsai/ds4/tree/argonaut-v41-benchmark). That branch includes the expert replica reader, scheduling changes and reproduction harness. This branch contains the separate GLM provider hooks and cannot reproduce the V4.1 campaign by itself. The historical 16.31 tok/s maximum is steady decode excluding the first step (14.70 including it); final publication gates remain open.
+> **V4.1 benchmark source:** use [`argonaut-v41-benchmark`](https://github.com/argonautlabsai/ds4-argodrive/tree/argonaut-v41-benchmark). That branch includes the expert replica reader, scheduling changes and reproduction harness. This branch contains the separate GLM provider hooks and cannot reproduce the V4.1 campaign by itself. The historical 16.31 tok/s maximum is steady decode excluding the first step (14.70 including it); final publication gates remain open.
 
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
