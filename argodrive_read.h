@@ -12,14 +12,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
-typedef struct { int fd; unsigned weight; uint64_t bytes; } ar_source;
+/* reads/lands_last/gap_ns: barrier attribution, see ar_read. Trailing fields
+ * so the positional initialisers below keep zeroing them. */
+typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; } ar_source;
 typedef struct { ar_source source[3]; unsigned count; int invalid; int owns_primary; uint64_t size; } ar_reader;
 typedef struct { uint64_t offset, length; } ar_piece;
 
 static void ar_close(ar_reader *r) {
     for (unsigned i=0; i<r->count; i++)
         fprintf(stderr,"ds4: Argodrive source[%u] bytes=%llu\n",i,(unsigned long long)__atomic_load_n(&r->source[i].bytes,__ATOMIC_RELAXED));
+    /* Barrier attribution, only when a split existed. Kept on its own line so
+     * the bytes= line above stays byte-identical for existing parsers. */
+    if (r->count>1)
+        for (unsigned i=0; i<r->count; i++)
+            fprintf(stderr,"ds4: Argodrive source[%u] lands_last=%llu gap_ns=%llu reads=%llu\n",i,
+                (unsigned long long)__atomic_load_n(&r->source[i].lands_last,__ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&r->source[i].gap_ns,__ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&r->source[i].reads,__ATOMIC_RELAXED));
     for (unsigned i=r->owns_primary?0:1; i<r->count; i++) close(r->source[i].fd);
     memset(r,0,sizeof(*r));
 }
@@ -41,7 +52,7 @@ static int ar_open(ar_reader *r, int primary, const char *paths, const char *wei
     r->size=(uint64_t)st.st_size;
     unsigned w=2;
     if (weight && !ar_weight(weight,&w)) return 0;
-    r->source[0]=(ar_source){primary,w,0}; r->count=1;
+    r->source[0]=(ar_source){.fd=primary,.weight=w}; r->count=1;
     if (uncached) {
         // Open an independent expert descriptor. Changing the mmap/Engram
         // descriptor's policy (including through dup) would confound this test.
@@ -84,7 +95,7 @@ static int ar_open(ar_reader *r, int primary, const char *paths, const char *wei
 #ifdef F_NOCACHE
         if(fcntl(fd,F_NOCACHE,1)<0 || fcntl(fd,F_RDAHEAD,0)<0) {close(fd);ok=0;break;}
 #endif
-        r->source[r->count++]=(ar_source){fd,w,0}; cursor=next;
+        r->source[r->count++]=(ar_source){.fd=fd,.weight=w}; cursor=next;
     }
     free(copy);
     if(!ok || r->count<2) {ar_close(r);r->invalid=1;return 0;}
@@ -123,14 +134,34 @@ static int ar_read(ar_reader *r,uint64_t offset,uint64_t length,uint8_t *dst,uin
     *bytes=0;
     ar_piece pieces[3];
     if(!dst || offset>LLONG_MAX || length>LLONG_MAX-offset || !ar_plan(r,offset,length,pieces)) return 0;
-    uint64_t counts[3]={0};
+    uint64_t counts[3]={0}, done_ns[3]={0};
     /* Completion barrier owns dst until all disjoint writes finish, including
      * failures. No partial buffer is accepted or retried while writes remain. */
-    ar_piece *pp=pieces; uint64_t *cc=counts;
+    ar_piece *pp=pieces; uint64_t *cc=counts, *dn=done_ns;
     dispatch_apply(r->count,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^(size_t i){
         cc[i]=ar_exact(r->source[i].fd,pp[i].offset,pp[i].length,dst+(pp[i].offset-offset));
+        dn[i]=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
         __atomic_fetch_add(&r->source[i].bytes,cc[i],__ATOMIC_RELAXED);
     });
+    /* Barrier attribution. A split read completes when its slowest slice
+     * lands, so charge this read's wait to the source that landed last and
+     * record how far behind the next-to-last it was: that gap is what removing
+     * or down-weighting the source would have saved on this read. Pieces of
+     * zero length did not take part; a single source has no barrier. */
+    if(r->count>1) {
+        int last=-1, second=-1;
+        for(unsigned i=0;i<r->count;i++) {
+            if(!pieces[i].length) continue;
+            if(last<0 || done_ns[i]>done_ns[last]) { second=last; last=(int)i; }
+            else if(second<0 || done_ns[i]>done_ns[second]) second=(int)i;
+        }
+        if(last>=0 && second>=0) {
+            __atomic_fetch_add(&r->source[last].lands_last,1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&r->source[last].gap_ns,done_ns[last]-done_ns[second],__ATOMIC_RELAXED);
+            for(unsigned i=0;i<r->count;i++)
+                if(pieces[i].length) __atomic_fetch_add(&r->source[i].reads,1,__ATOMIC_RELAXED);
+        }
+    }
     int ok=1;
     for(unsigned i=0;i<r->count;i++) {*bytes+=counts[i];if(counts[i]!=pieces[i].length) ok=0;}
     return ok;
