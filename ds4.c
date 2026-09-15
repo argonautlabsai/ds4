@@ -39171,6 +39171,7 @@ typedef struct {
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
+    const ds4_weights *step_weights;   /* set per decode step; the lookahead probe needs layer il+1 */
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -39670,6 +39671,160 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* ---- V4.1 router-lookahead probe -------------------------------------------------
+ * Diagnostic only: predicts layer il+1's routed experts from this layer's normalized
+ * MoE input and scores that prediction against il+1's real selection. It issues no
+ * reads and changes no output — it exists to decide whether a decode prefetch can pay
+ * before one is built. Both readbacks sit inside the drain the early-expert load
+ * already performs, so it adds no synchronization. DS4_ARGODRIVE_LOOKAHEAD_PROBE=1. */
+#define AR_LA_MAX_LAYER 64
+static ds4_gpu_tensor *g_ar_la_logits, *g_ar_la_probs, *g_ar_la_selected, *g_ar_la_weights;
+static int32_t  g_ar_la_pred[DS4_MAX_EXPERT_USED];
+static int      g_ar_la_pending = -1;
+static int      g_ar_la_encoded, g_ar_la_have;
+static int32_t  g_ar_la_real[DS4_MAX_EXPERT_USED];
+static uint32_t g_ar_la_real_n;
+static uint64_t g_ar_la_issued;
+static uint64_t g_ar_la_layers, g_ar_la_hits, g_ar_la_hist[DS4_MAX_EXPERT_USED + 1];
+static uint64_t g_ar_la_layer_n[AR_LA_MAX_LAYER], g_ar_la_layer_hits[AR_LA_MAX_LAYER];
+static int ar_la_probe_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_LOOKAHEAD_PROBE"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static void ar_la_probe_report(void) {
+    if (g_ar_la_issued)
+        fprintf(stderr, "ds4: V4.1 decode read-ahead: speculative loads issued=%llu\n",
+                (unsigned long long)g_ar_la_issued);
+    if (!g_ar_la_layers) return;
+    fprintf(stderr, "ds4: V4.1 router lookahead probe: layers=%llu mean_overlap=%.2f/%u hist=",
+            (unsigned long long)g_ar_la_layers,
+            (double)g_ar_la_hits / (double)g_ar_la_layers, (unsigned)DS4_N_EXPERT_USED);
+    for (uint32_t k = 0; k <= DS4_N_EXPERT_USED && k <= DS4_MAX_EXPERT_USED; k++)
+        fprintf(stderr, "%s%llu", k ? "," : "", (unsigned long long)g_ar_la_hist[k]);
+    fprintf(stderr, "\nds4: V4.1 router lookahead per layer (mean overlap):");
+    for (uint32_t il = 0; il < DS4_N_LAYER && il < AR_LA_MAX_LAYER; il++)
+        if (g_ar_la_layer_n[il])
+            fprintf(stderr, " %u:%.1f", il, (double)g_ar_la_layer_hits[il] / (double)g_ar_la_layer_n[il]);
+    fprintf(stderr, "\n");
+}
+static int ar_decode_ahead_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_DECODE_AHEAD"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static int ar_la_active(void) { return ar_la_probe_enabled() || ar_decode_ahead_enabled(); }
+/* Skip layers whose prediction is measurably weak (probe 2026-09-15: layers 1-2 and
+ * 15-16 score 1.5-2.9 of 6 against 4.2 overall). DS4_ARGODRIVE_DECODE_AHEAD_MIN_OVERLAP
+ * is expressed in whole experts; 0 prefetches every layer. */
+/* How many of the predicted experts to fetch, most-confident first. Fetching all six
+ * doubled the bytes and the evictions (2026-09-15: 61.9 -> 121.5 GiB, hit rate
+ * 0.864 -> 0.817) because the cache is full and every speculative fill displaces a
+ * resident expert. GLM settled on 2 for the same reason. */
+static uint32_t ar_decode_ahead_k(void) {
+    static int checked; static uint32_t k;
+    if (!checked) {
+        const char *e = getenv("DS4_ARGODRIVE_DECODE_AHEAD_K");
+        long v = e && *e ? strtol(e, NULL, 10) : 2;
+        if (v < 1) v = 1;
+        if (v > DS4_N_EXPERT_USED) v = DS4_N_EXPERT_USED;
+        k = (uint32_t)v; checked = 1;
+    }
+    return k;
+}
+static int ar_la_layer_worth_it(uint32_t target) {
+    static int checked; static uint32_t min_layer;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_DECODE_AHEAD_MIN_LAYER"); min_layer = e ? (uint32_t)atoi(e) : 0; checked = 1; }
+    return target >= min_layer;
+}
+/* Encode layer il+1's predicted routing into the batch that is open now, so the
+ * result lands in the drain the early-expert load is about to perform. */
+static void ar_la_encode(ds41_gpu_graph *g, const ds4_model *m, uint32_t il, uint32_t token) {
+    static int registered;
+    if (!registered) { atexit(ar_la_probe_report); registered = 1; }
+    g_ar_la_encoded = 0;
+    const ds4_weights *w = g->step_weights;
+    if (!w || il + 1u >= DS4_N_LAYER || il + 1u >= AR_LA_MAX_LAYER) return;
+    const ds4_layer_weights *ln = &w->layer[il + 1u];
+    const ds4_tensor *nbias = ds41_image_at(g, g->pos) ? ln->ffn_exp_probs_vl : ln->ffn_exp_probs_b;
+    if (!ln->ffn_gate_inp || !nbias) return;
+    if (!g_ar_la_logits) {
+        g_ar_la_logits   = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_ar_la_probs    = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_ar_la_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_ar_la_weights  = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (!g_ar_la_logits || !g_ar_la_probs || !g_ar_la_selected || !g_ar_la_weights) return;
+    }
+    /* A failure here is silent by design — the lookahead must never break decode. */
+    if (!ds41_matmul(g_ar_la_logits, m, ln->ffn_gate_inp, g->norm, false)) return;
+    if (!ds4_gpu_router_select_tensor(g_ar_la_selected, g_ar_la_weights, g_ar_la_probs,
+            m->map, m->size, nbias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g_ar_la_logits)) return;
+    g_ar_la_encoded = 1;
+}
+/* Called immediately after the early-expert load, which ended the batch: score the
+ * prediction that was made for this layer, then take the one made for the next. */
+static void ar_la_take(ds41_gpu_graph *g, uint32_t il) {
+    if (ar_la_probe_enabled() && g_ar_la_have && g_ar_la_pending == (int)il) {
+        int32_t real[DS4_MAX_EXPERT_USED];
+        for (uint32_t i = 0; i < DS4_MAX_EXPERT_USED; i++) real[i] = -1;
+        if (ds4_gpu_tensor_read(g->selected, 0, real,
+                (uint64_t)DS4_N_EXPERT_USED * sizeof(real[0])) != 0 && il < AR_LA_MAX_LAYER) {
+            uint32_t hit = 0;
+            for (uint32_t a = 0; a < DS4_N_EXPERT_USED; a++)
+                for (uint32_t b = 0; b < DS4_N_EXPERT_USED; b++)
+                    if (real[a] >= 0 && real[a] == g_ar_la_pred[b]) { hit++; break; }
+            g_ar_la_layers++; g_ar_la_hits += hit;
+            g_ar_la_hist[hit > DS4_MAX_EXPERT_USED ? DS4_MAX_EXPERT_USED : hit]++;
+            g_ar_la_layer_n[il]++; g_ar_la_layer_hits[il] += hit;
+        }
+    }
+    g_ar_la_have = 0; g_ar_la_pending = -1;
+    g_ar_la_real_n = 0;
+    if (ds4_gpu_tensor_read(g->selected, 0, g_ar_la_real,
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(g_ar_la_real[0])) != 0)
+        g_ar_la_real_n = DS4_N_EXPERT_USED;
+    if (!g_ar_la_encoded || !g_ar_la_selected) return;
+    for (uint32_t i = 0; i < DS4_MAX_EXPERT_USED; i++) g_ar_la_pred[i] = -1;
+    if (ds4_gpu_tensor_read(g_ar_la_selected, 0, g_ar_la_pred,
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(g_ar_la_pred[0])) == 0) return;
+    g_ar_la_have = 1; g_ar_la_pending = (int)(il + 1u);
+}
+/* Issue the predicted reads for layer il+1 once this layer's demand load has been
+ * consumed, so they run while the GPU computes this layer's MoE. If the prediction
+ * is wrong the next layer's clear() installs whatever landed and re-reads the rest;
+ * nothing here can change what the model computes. */
+static void ar_la_issue(ds41_gpu_graph *g, const ds4_model *m, uint32_t il) {
+    if (!ar_decode_ahead_enabled() || !g_ar_la_have) return;
+    const ds4_weights *w = g->step_weights;
+    if (!w || g_ar_la_pending != (int)(il + 1u) || il + 1u >= DS4_N_LAYER) return;
+    if (!ar_la_layer_worth_it(il + 1u)) return;
+    const ds4_layer_weights *ln = &w->layer[il + 1u];
+    if (!ln->ffn_gate_exps || !ln->ffn_up_exps || !ln->ffn_down_exps) return;
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return;
+    const ds4_gpu_stream_expert_table nt = {
+        .model_map = m->map, .model_size = m->size, .layer = il + 1u,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = ln->ffn_gate_exps->abs_offset,
+        .up_offset   = ln->ffn_up_exps->abs_offset,
+        .down_offset = ln->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_row * DS4_N_FF_EXP,
+        .down_expert_bytes = down_row * DS4_N_EMBD,
+    };
+    /* This layer's MoE is encoded but not finished; its experts must survive the
+     * speculative allocation below. */
+    if (g_ar_la_real_n)
+        (void)ds4_gpu_stream_expert_cache_protect_layer(m->map, m->size, il,
+                                                        g_ar_la_real, g_ar_la_real_n);
+    if (ds4_gpu_stream_expert_cache_begin_selected_load(&nt, g_ar_la_pred, ar_decode_ahead_k()))
+        g_ar_la_issued++;
+}
+#endif
+
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -39699,8 +39854,18 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             .gate_expert_bytes=gate_row * DS4_N_FF_EXP,
             .down_expert_bytes=down_row * DS4_N_EMBD,
         };
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Predict layer il+1 into the batch that is still open, so the result is
+         * carried by the drain the load below performs rather than a new one. */
+        if (ar_la_active()) ar_la_encode(g, m, il, token);
+#endif
         if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                 &table, g->selected, DS4_N_EXPERT_USED)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* The load above ended the batch, so this layer's real selection and the
+         * prediction encoded above are both readable here without a new drain. */
+        if (ar_la_active()) ar_la_take(g, il);
+#endif
     }
     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
@@ -39716,6 +39881,11 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* This layer's demand load has been consumed; the pending slot is free and the
+     * GPU is busy with this MoE, which is the window the next layer's reads need. */
+    if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix) ar_la_issue(g, m, il);
+#endif
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
@@ -40076,6 +40246,71 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static int ar_prefill_selective_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_SELECTIVE"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+/* Selective staging trades the read-ahead overlap for fewer bytes, so it only wins
+ * while the chunk's expert union is small enough. Measured 2026-09-15 (512-token
+ * prompt, three drives): 512 tokens touch 48.8 % of the experts and selective wins
+ * by 7.2 %; 1024 touch 60.1 % and it loses by 13 %; 2048 touch 70.7 % and it loses
+ * by 25 %. The break-even is coverage < 1 - compute/read, which lands between 512
+ * and 1024 tokens. */
+static int ar_prefill_selective_for(uint32_t count) {
+    if (!ar_prefill_selective_enabled()) return 0;
+    static int checked; static uint32_t max_count;
+    if (!checked) {
+        const char *e = getenv("DS4_ARGODRIVE_PREFILL_SELECTIVE_MAX");
+        long v = e && *e ? strtol(e, NULL, 10) : 512;
+        max_count = v > 0 ? (uint32_t)v : 0;
+        checked = 1;
+        fprintf(stderr, "ds4: Argodrive selective prefill staging for chunks <= %u tokens\n", max_count);
+    }
+    return count <= max_count;
+}
+/* Stage only the experts this chunk routed to. The router needs nothing but resident
+ * weights, so running it before any expert byte is read costs one drain per layer and
+ * halves the bytes: a 512-token chunk touches ~187 of 384 experts. */
+static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
+                                          const ds4_layer_weights *l, uint32_t count) {
+    if (!ar_prefill_selective_for(count)) return true;
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return false;
+    const int had_batch = ds4_gpu_commands_active() != 0;
+    if (had_batch && !ds4_gpu_end_commands()) return false;
+    const int32_t *selected = ds4_gpu_tensor_contents(g->batch.selected);
+    bool ok = selected != NULL;
+    if (ok) {
+        static uint8_t seen[DS4_MAX_EXPERT];
+        static int32_t ids[DS4_MAX_EXPERT];
+        memset(seen, 0, sizeof(seen));
+        uint32_t n_ids = 0;
+        for (uint32_t t = 0; ok && t < count; t++) {
+            for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                const int32_t id = selected[t * DS4_N_EXPERT_USED + j];
+                if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) { ok = false; break; }
+                seen[id] = 1;
+            }
+        }
+        if (ok) {
+            for (uint32_t i = 0; i < DS4_N_EXPERT; i++) if (seen[i]) ids[n_ids++] = (int32_t)i;
+            const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+            const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+            const uint64_t offsets[3] = { l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                          l->ffn_down_exps->abs_offset };
+            const uint64_t sizes[3] = { l->ffn_gate_exps->bytes, l->ffn_up_exps->bytes,
+                                        l->ffn_down_exps->bytes };
+            ok = n_ids > 0 && ar_prefill_stage_ids(m->map, m->size, offsets, sizes,
+                                                   gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                                   ids, n_ids) != 0;
+        }
+    }
+    if (had_batch && !ds4_gpu_begin_commands()) return false;
+    return ok;
+}
+#endif
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner) {
@@ -40085,6 +40320,9 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     bool mid_f16 = false;
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        ds41_stage_selected_for_layer(g, m, l, count) &&
+#endif
         ((shared_owner && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
@@ -40116,6 +40354,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ar_profile) ar_gpu_profile_snapshot(ar_gpu_start);
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
+    g->step_weights = w;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     unsigned ar_engram_readers=1;
     const char *ar_er=getenv("DS4_ARGODRIVE_ENGRAM_READERS");
@@ -40198,6 +40437,28 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static uint64_t g_ds41_cov_layers, g_ds41_cov_unique, g_ds41_cov_tokens;
+static uint64_t g_ds41_cov_prev_hits, g_ds41_cov_prev_n;
+static uint32_t g_ds41_cov_layer_unique[64];
+static void ds41_expert_coverage_report(void) {
+    if (!g_ds41_cov_layers) return;
+    fprintf(stderr, "ds4: V4.1 prefill expert coverage: %llu layers, mean %.1f of %u experts touched"
+            " (%.1f%%) by a %llu-token chunk\n",
+            (unsigned long long)g_ds41_cov_layers,
+            (double)g_ds41_cov_unique / (double)g_ds41_cov_layers, (unsigned)DS4_N_EXPERT,
+            100.0 * (double)g_ds41_cov_unique / ((double)g_ds41_cov_layers * (double)DS4_N_EXPERT),
+            (unsigned long long)g_ds41_cov_tokens);
+    if (g_ds41_cov_prev_n)
+        fprintf(stderr, "ds4: V4.1 prefill adjacent-layer union overlap: %.1f%% of a layer's experts"
+                " are already in the previous layer's union\n",
+                100.0 * (double)g_ds41_cov_prev_hits / (double)g_ds41_cov_prev_n);
+    fprintf(stderr, "ds4: V4.1 prefill coverage per layer:");
+    for (uint32_t il = 0; il < DS4_N_LAYER && il < 64; il++)
+        if (g_ds41_cov_layer_unique[il]) fprintf(stderr, " %u:%u", il, g_ds41_cov_layer_unique[il]);
+    fprintf(stderr, "\n");
+}
+#endif
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -40216,6 +40477,37 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
             frequency[id] += 1u + (t >= count - recent ? count * DS4_N_EXPERT_USED : 0u);
         }
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* How much of the routed set this prompt actually touches. The sweep stages all
+     * DS4_N_EXPERT experts per layer; anything well below that is the headroom for
+     * staging only the selected ones. Diagnostic only. */
+    if (getenv("DS4_ARGODRIVE_EXPERT_COVERAGE")) {
+        static uint64_t cov_layers, cov_unique, cov_tokens;
+        static int cov_registered;
+        if (!cov_registered) {
+            cov_registered = 1;
+            atexit(ds41_expert_coverage_report);
+        }
+        uint32_t unique = 0;
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) if (frequency[i]) unique++;
+        /* How much of this layer's union the PREVIOUS layer's union already covers.
+         * High overlap means layer il-1's selection is a usable prediction for il,
+         * which is what lets the staging read run ahead of the router. */
+        {
+            static uint8_t prev[DS4_MAX_EXPERT]; static int have_prev;
+            if (have_prev) {
+                uint32_t covered = 0;
+                for (uint32_t i = 0; i < DS4_N_EXPERT; i++) if (frequency[i] && prev[i]) covered++;
+                g_ds41_cov_prev_hits += covered; g_ds41_cov_prev_n += unique;
+            }
+            for (uint32_t i = 0; i < DS4_N_EXPERT; i++) prev[i] = frequency[i] ? 1u : 0u;
+            have_prev = 1;
+        }
+        cov_layers++; cov_unique += unique; cov_tokens = count;
+        g_ds41_cov_layers = cov_layers; g_ds41_cov_unique = cov_unique; g_ds41_cov_tokens = cov_tokens;
+        if (il < 64) { g_ds41_cov_layer_unique[il] = unique; }
+    }
+#endif
     int32_t experts[DS4_MAX_EXPERT];
     uint32_t priority[DS4_MAX_EXPERT], n = 0;
     while (n < target) {
@@ -40515,6 +40807,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const char *ar_prefill_env=getenv("DS4_ARGODRIVE_PREFILL_SPLIT");
+    const bool ar_prefill=ar_prefill_env && strcmp(ar_prefill_env,"0")!=0;
+    if (ar_prefill && (!g->streaming || g->tp_world!=1 || g->encoder_resident || g->quality)) {
+        fprintf(stderr,"ds4: Argodrive prefill requires single-host streaming without encoder residency or quality mode\n");
+        return false;
+    }
+#else
+    const bool ar_prefill=false;
+#endif
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     const bool wide = total_count > encoder_chunk;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
@@ -40567,11 +40869,35 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         const double t0 = profile ? now_sec() : 0;
         const uint32_t first_count = total_count < encoder_chunk ? total_count : encoder_chunk;
         if (g->streaming) {
-            if (!g->encoder_resident || il >= 20)
+            if (!ar_prefill && (!g->encoder_resident || il >= 20))
                 ok = metal_graph_stream_prepare_join_layer(NULL, m, w, il, first_count,
                         false, true, false, false, &prepare, 1);
-            if (ok) ok = metal_graph_stream_map_layer(m, w, il);
-            if (ok && il + 1u < (encoder_only ? 20u : DS4_N_LAYER) &&
+            if (ok) ok = ar_prefill ? metal_graph_stream_map_layer_decode(m,w,il) : metal_graph_stream_map_layer(m,w,il);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && ar_prefill && !ar_prefill_selective_for(total_count)) {
+                const ds4_layer_weights *l=&w->layer[il];
+                if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+                    fprintf(stderr,"ds4: Argodrive prefill layer %u has no routed expert tensors\n",il);
+                    ok=false;
+                }
+                else {
+                    const uint64_t offsets[3]={l->ffn_gate_exps->abs_offset,l->ffn_up_exps->abs_offset,l->ffn_down_exps->abs_offset};
+                    const uint64_t sizes[3]={l->ffn_gate_exps->bytes,l->ffn_up_exps->bytes,l->ffn_down_exps->bytes};
+                    ok=ar_prefill_stage(m->map,m->size,offsets,sizes)!=0;
+                    /* Read the next layer while this one computes. The stage above
+                     * synchronized, so the set this fills is one the GPU has left. */
+                    if (ok && il + 1u < DS4_N_LAYER) {
+                        const ds4_layer_weights *nl=&w->layer[il+1u];
+                        if (nl->ffn_gate_exps && nl->ffn_up_exps && nl->ffn_down_exps) {
+                            const uint64_t noff[3]={nl->ffn_gate_exps->abs_offset,nl->ffn_up_exps->abs_offset,nl->ffn_down_exps->abs_offset};
+                            const uint64_t nsz[3]={nl->ffn_gate_exps->bytes,nl->ffn_up_exps->bytes,nl->ffn_down_exps->bytes};
+                            (void)ar_prefill_stage_ahead(m->map,m->size,noff,nsz);
+                        }
+                    }
+                }
+            }
+#endif
+            if (ok && !ar_prefill && il + 1u < (encoder_only ? 20u : DS4_N_LAYER) &&
                 (!g->encoder_resident || il + 1u >= 20))
                 ok = metal_graph_stream_prepare_start_if_needed(NULL, m, w, il + 1u, first_count,
                         false, true, false, false, &prepare, 1);
@@ -40776,6 +41102,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ar_prefill && !ar_prefill_release()) ok=false;
+#endif
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
         ok = ds4_gpu_begin_commands() &&

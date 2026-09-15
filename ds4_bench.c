@@ -640,6 +640,7 @@ static void close_engine(ds4_engine *engine, ds4_tp *tp) {
 }
 
 int main(int argc, char **argv) {
+    const double ar_launch_t0=bench_now_sec();
     bench_config cfg = parse_options(argc, argv);
 
     /* Hint the packer at the largest ctx this bench run will exercise
@@ -931,8 +932,11 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (gen_done == 0 && getenv("DS4_ARGODRIVE_ACCOUNTING"))
-                fprintf(stderr,"ARGODRIVE_FIRST_TOKEN_READY %.9f %.9f\n",prefill_t0,bench_now_sec());
+            if (gen_done == 0 && getenv("DS4_ARGODRIVE_PHASES")) {
+                double ready=bench_now_sec();
+                fprintf(stderr,"ARGODRIVE_FIRST_TOKEN_READY %.9f %.9f\n",prefill_t0,ready);
+                fprintf(stderr,"ARGODRIVE_LAUNCH_TO_FIRST_TOKEN %.9f %.9f\n",ar_launch_t0,ready);
+            }
             const double token_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
             if (gen_done == cuda_profile_start && cudaProfilerStart) {

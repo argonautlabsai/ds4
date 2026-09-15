@@ -34,6 +34,73 @@ void ar_expert_bytes_snapshot(uint64_t out[3]) {
         out[i]=__atomic_load_n(&g_argodrive_reader.source[i].bytes,__ATOMIC_RELAXED);
 }
 
+typedef struct {
+    id<MTLBuffer> buffer;
+    const void *map;
+    uint64_t model_size, offset, bytes;
+} ar_prefill_view;
+static ar_prefill_view ar_prefill_views[3];
+/* The staging buffers are anonymous dirty pages, not evictable file-backed ones:
+ * allocating a fresh set per layer swapped the machine (3.8 GiB of swap in ten
+ * layers). One set is allocated on the first layer and refilled in place. */
+/* Two sets: the published one feeds the GPU while the other is refilled for the
+ * next layer. Sized by the engine's own prefill reserve (14.24 GiB here, which is
+ * exactly two routed layers). Depth beyond two buys nothing — one layer's read
+ * already covers one layer's compute — and costs another layer of dirty pages. */
+static id<MTLBuffer> ar_prefill_pool[2][3];
+static uint64_t ar_prefill_pool_bytes[2][3];
+static unsigned ar_prefill_published_set=1;
+/* Chunks in flight per staged tensor; each one issues a read to every source, so
+ * this is also the per-drive queue depth. DS4_ARGODRIVE_PREFILL_LANES=1 restores
+ * the serial loop. */
+static uint64_t ar_prefill_lanes(void) {
+    static uint64_t lanes;
+    if (lanes) return lanes;
+    const char *e=getenv("DS4_ARGODRIVE_PREFILL_LANES");
+    long v=e&&*e?strtol(e,NULL,10):8;
+    if (v<1) v=1;
+    if (v>64) v=64;
+    lanes=(uint64_t)v;
+    fprintf(stderr,"ds4: Argodrive prefill staging lanes=%llu\n",(unsigned long long)lanes);
+    return lanes;
+}
+/* DS4_ARGODRIVE_PREFILL_AHEAD=1: read layer il+1 while the GPU computes layer il.
+ * Off by default — it doubles the staging reserve. */
+static int ar_prefill_ahead_enabled(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e=getenv("DS4_ARGODRIVE_PREFILL_AHEAD");
+        on=e && strcmp(e,"0")!=0;
+        checked=1;
+        if (on) fprintf(stderr,"ds4: Argodrive prefill read-ahead: one layer\n");
+    }
+    return on;
+}
+static pthread_t ar_ahead_thread;
+static int ar_ahead_running, ar_ahead_ok;
+static unsigned ar_ahead_set;
+static uint64_t ar_ahead_off[3], ar_ahead_len[3];
+static int ar_prefill_fill(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3]);
+static void *ar_prefill_ahead_main(void *arg) {
+    (void)arg;
+    ar_ahead_ok=ar_prefill_fill(ar_ahead_set,ar_ahead_off,ar_ahead_len);
+    return NULL;
+}
+static void ar_prefill_ahead_join(void) {
+    if (!ar_ahead_running) return;
+    (void)pthread_join(ar_ahead_thread,NULL);
+    ar_ahead_running=0;
+}
+static id<MTLBuffer> ar_prefill_lookup(const void *map, uint64_t size, uint64_t offset, uint64_t len, uint64_t *inner) {
+    for (unsigned i=0;i<3;i++) {
+        ar_prefill_view *v=&ar_prefill_views[i];
+        if (v->buffer && v->map==map && v->model_size==size && offset>=v->offset &&
+            offset-v->offset<=v->bytes && len<=v->bytes-(offset-v->offset)) {
+            *inner=offset-v->offset; return v->buffer;
+        }
+    }
+    return nil;
+}
 static uint64_t ar_resident_gate_layers;
 
 /*
@@ -12762,6 +12829,257 @@ int ds4_gpu_set_model_map_spans(
     }
 }
 
+int ar_prefill_clear(void) {
+    /* Never refill or release CPU/GPU-visible storage while an open batch may use
+     * it. Unpublishes the views; the pooled storage stays allocated. */
+    if (ds4_gpu_commands_active() || !ds4_gpu_synchronize()) return 0;
+    for (unsigned i=0;i<3;i++) ar_prefill_views[i]=(ar_prefill_view){0};
+    return 1;
+}
+int ar_prefill_release(void) {
+    /* End of the sweep: hand the staging reserve back before decode grows the
+     * expert cache into it. */
+    ar_prefill_ahead_join();
+    if (!ar_prefill_clear()) return 0;
+    for (unsigned set=0;set<2;set++)
+        for (unsigned i=0;i<3;i++) { ar_prefill_pool[set][i]=nil; ar_prefill_pool_bytes[set][i]=0; }
+    return 1;
+}
+/* Fills one set from the verified replicas. Runs on the caller's thread — the
+ * read-ahead thread when the GPU is busy with the previous layer. The set being
+ * filled is never the published one, so no GPU consumer can see a partial fill. */
+static int ar_prefill_fill(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3]) {
+    for (unsigned i=0;i<3;i++) {
+        if (!ar_prefill_pool[set][i] || ar_prefill_pool_bytes[set][i]<sizes[i]) {
+            ar_prefill_pool[set][i]=nil; ar_prefill_pool_bytes[set][i]=0;
+            id<MTLBuffer> fresh=[g_device newBufferWithLength:(NSUInteger)sizes[i] options:MTLResourceStorageModeShared];
+            if (!fresh) {
+                fprintf(stderr,"ds4: Argodrive prefill stage rejected: cannot allocate %.2f GiB staging buffer %u\n",
+                    ds4_gpu_gib(sizes[i]),i);
+                return 0;
+            }
+            ar_prefill_pool[set][i]=fresh; ar_prefill_pool_bytes[set][i]=sizes[i];
+        }
+        /* One 32 MiB chunk is one pread per source, so a serial chunk loop leaves
+         * every drive at queue depth 1 (measured 23.0 GB/s of a 27.8 GB/s ceiling).
+         * Lanes walk disjoint strided chunks, giving each drive `lanes` requests in
+         * flight without any extra staging memory. */
+        const uint64_t chunk=UINT64_C(32)<<20;
+        const uint64_t n_chunks=(sizes[i]+chunk-1)/chunk;
+        uint64_t lanes=ar_prefill_lanes();
+        if (lanes>n_chunks) lanes=n_chunks;
+        uint8_t *dst=(uint8_t *)[ar_prefill_pool[set][i] contents];
+        const uint64_t off_i=offsets[i], len_i=sizes[i];
+        __block int failed=0;
+        dispatch_apply((size_t)lanes,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^(size_t lane){
+            for (uint64_t c=lane;c<n_chunks;c+=lanes) {
+                if (__atomic_load_n(&failed,__ATOMIC_RELAXED)) return;
+                const uint64_t pos=c*chunk;
+                uint64_t n=len_i-pos, got=0;
+                if (n>chunk) n=chunk;
+                if (!ar_read(&g_argodrive_reader,off_i+pos,n,dst+pos,&got) || got!=n)
+                    __atomic_store_n(&failed,1,__ATOMIC_RELAXED);
+            }
+        });
+        if (failed) {
+            fprintf(stderr,"ds4: Argodrive prefill partial read rejected; layer not published\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+static int ar_prefill_ranges_valid(const void *map, uint64_t size,
+                                   const uint64_t offsets[3], const uint64_t sizes[3], int loud);
+/* Selective staging: read only the experts this chunk's router actually selected.
+ * A 512-token chunk touches ~187 of 384 experts per layer (measured 2026-09-15), so
+ * the layer-major stage reads about twice what the model uses. The buffers stay
+ * full size so expert addressing is unchanged — only the bytes read shrink; slots
+ * for untouched experts keep stale content that no kernel indexes. */
+typedef struct { uint64_t src, dst, len; } ar_prefill_piece;
+
+static int ar_prefill_fill_pieces(unsigned set, unsigned i,
+                                  const ar_prefill_piece *pieces, uint32_t n_pieces) {
+    if (!n_pieces) return 1;
+    uint8_t *dst = (uint8_t *)[ar_prefill_pool[set][i] contents];
+    if (!dst) return 0;
+    uint64_t lanes = ar_prefill_lanes();
+    if (lanes > n_pieces) lanes = n_pieces;
+    __block int failed = 0;
+    dispatch_apply((size_t)lanes, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t lane){
+        for (uint32_t c = (uint32_t)lane; c < n_pieces; c += (uint32_t)lanes) {
+            if (__atomic_load_n(&failed, __ATOMIC_RELAXED)) return;
+            uint64_t got = 0;
+            if (!ar_read(&g_argodrive_reader, pieces[c].src, pieces[c].len, dst + pieces[c].dst, &got) ||
+                got != pieces[c].len)
+                __atomic_store_n(&failed, 1, __ATOMIC_RELAXED);
+        }
+    });
+    return !failed;
+}
+
+int ar_prefill_stage_ids(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         const int32_t *ids, uint32_t n_ids) {
+    if (!ar_prefill_ranges_valid(map, size, offsets, sizes, 1)) return 0;
+    if (!ids || n_ids == 0 || !gate_expert_bytes || !down_expert_bytes) return 0;
+    const double t0 = ds4_gpu_now_ms();
+    uint64_t before[3]; ar_expert_bytes_snapshot(before);
+    const unsigned set = ar_prefill_published_set ^ 1u;
+    if (!ar_prefill_clear()) {
+        fprintf(stderr, "ds4: Argodrive prefill stage rejected: previous views still held (commands_active=%d)\n",
+                ds4_gpu_commands_active());
+        return 0;
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        if (!ar_prefill_pool[set][i] || ar_prefill_pool_bytes[set][i] < sizes[i]) {
+            ar_prefill_pool[set][i] = nil; ar_prefill_pool_bytes[set][i] = 0;
+            id<MTLBuffer> fresh = [g_device newBufferWithLength:(NSUInteger)sizes[i] options:MTLResourceStorageModeShared];
+            if (!fresh) {
+                fprintf(stderr, "ds4: Argodrive prefill stage rejected: cannot allocate %.2f GiB staging buffer %u\n",
+                        ds4_gpu_gib(sizes[i]), i);
+                return 0;
+            }
+            ar_prefill_pool[set][i] = fresh; ar_prefill_pool_bytes[set][i] = sizes[i];
+        }
+    }
+    /* Consecutive expert ids coalesce into one read; 32 MiB is the largest piece so
+     * the lanes keep every drive busy the way the full-layer path does. */
+    static ar_prefill_piece pieces[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * 4u];
+    const uint64_t chunk = UINT64_C(32) << 20;
+    uint64_t requested = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        const uint64_t per = (i == 2) ? down_expert_bytes : gate_expert_bytes;
+        if (!per) return 0;
+        uint32_t n_pieces = 0;
+        uint32_t k = 0;
+        while (k < n_ids) {
+            uint32_t run_end = k + 1;
+            while (run_end < n_ids && ids[run_end] == ids[run_end - 1] + 1) run_end++;
+            const uint64_t rel = (uint64_t)ids[k] * per;
+            uint64_t len = (uint64_t)(run_end - k) * per;
+            if (rel > sizes[i] || len > sizes[i] - rel) return 0;
+            for (uint64_t done = 0; done < len; ) {
+                uint64_t take = len - done; if (take > chunk) take = chunk;
+                if (n_pieces >= sizeof(pieces)/sizeof(pieces[0])) return 0;
+                pieces[n_pieces++] = (ar_prefill_piece){ offsets[i] + rel + done, rel + done, take };
+                done += take;
+            }
+            requested += len;
+            k = run_end;
+        }
+        if (!ar_prefill_fill_pieces(set, i, pieces, n_pieces)) {
+            fprintf(stderr, "ds4: Argodrive prefill partial read rejected; layer not published\n");
+            return 0;
+        }
+    }
+    uint64_t total = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        ar_prefill_views[i] = (ar_prefill_view){ ar_prefill_pool[set][i], map, size, offsets[i], sizes[i] };
+        total += sizes[i];
+    }
+    ar_prefill_published_set = set;
+    uint64_t after[3]; ar_expert_bytes_snapshot(after);
+    fprintf(stderr, "ds4: Argodrive prefill staged(selected) experts=%u bytes=%llu of %llu (%.0f%%)"
+            " source_bytes=%llu,%llu,%llu ms=%.3f\n",
+            n_ids, (unsigned long long)requested, (unsigned long long)total,
+            100.0 * (double)requested / (double)total,
+            (unsigned long long)(after[0]-before[0]), (unsigned long long)(after[1]-before[1]),
+            (unsigned long long)(after[2]-before[2]), ds4_gpu_now_ms() - t0);
+    return 1;
+}
+
+static int ar_prefill_ranges_valid(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3], int loud) {
+    if (!map || !offsets || !sizes) {
+        if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: null argument\n");
+        return 0;
+    }
+    /* The engine maps the weight region only (V4.1 keeps its Engram table outside
+     * the map), so the map extent is smaller than the file. Expert offsets are
+     * file-absolute — the decode path preads the same values — so the map need
+     * only lie inside the file the replicas were verified against. */
+    if (!size || size>g_argodrive_reader.size) {
+        if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: mapped model %llu bytes outside reader file %llu bytes\n",
+            (unsigned long long)size,(unsigned long long)g_argodrive_reader.size);
+        return 0;
+    }
+    if (g_argodrive_reader.invalid || g_argodrive_reader.count<2) {
+        if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: reader invalid=%d sources=%u\n",
+            g_argodrive_reader.invalid,g_argodrive_reader.count);
+        return 0;
+    }
+    uint64_t total=0;
+    for (unsigned i=0;i<3;i++) {
+        if (!sizes[i] || offsets[i]>size || sizes[i]>size-offsets[i]) {
+            if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: tensor %u range %llu+%llu outside %llu\n",
+                i,(unsigned long long)offsets[i],(unsigned long long)sizes[i],(unsigned long long)size);
+            return 0;
+        }
+        if (sizes[i]>(uint64_t)[g_device maxBufferLength]) {
+            if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: tensor %u %.2f GiB exceeds maxBufferLength %.2f GiB\n",
+                i,ds4_gpu_gib(sizes[i]),ds4_gpu_gib((uint64_t)[g_device maxBufferLength]));
+            return 0;
+        }
+        if (sizes[i]>(UINT64_C(8)<<30)-total) {
+            if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: layer needs %.2f GiB, cap is 8.00 GiB\n",
+                ds4_gpu_gib(total+sizes[i]));
+            return 0;
+        }
+        total+=sizes[i];
+        for (unsigned j=0;j<i;j++)
+            if (offsets[i]<offsets[j]+sizes[j] && offsets[j]<offsets[i]+sizes[i]) {
+                if (loud) fprintf(stderr,"ds4: Argodrive prefill stage rejected: tensors %u and %u overlap\n",j,i);
+                return 0;
+            }
+    }
+    return 1;
+}
+int ar_prefill_stage(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]) {
+    /* Every rejection is fatal to the prefill sweep, so each one says why. */
+    if (!ar_prefill_ranges_valid(map,size,offsets,sizes,1)) return 0;
+    const double t0=ds4_gpu_now_ms();
+    uint64_t before[3]; ar_expert_bytes_snapshot(before);
+    unsigned set=ar_prefill_published_set^1u;
+    int prefetched=0;
+    if (ar_ahead_running) {
+        ar_prefill_ahead_join();
+        if (ar_ahead_ok && memcmp(ar_ahead_off,offsets,sizeof ar_ahead_off)==0 &&
+            memcmp(ar_ahead_len,sizes,sizeof ar_ahead_len)==0) { set=ar_ahead_set; prefetched=1; }
+    }
+    /* One complete routed layer, within the existing prefill reserve. Publish only
+     * after every byte has landed. No mapped-file writes. */
+    if (!ar_prefill_clear()) {
+        fprintf(stderr,"ds4: Argodrive prefill stage rejected: previous views still held (commands_active=%d)\n",
+            ds4_gpu_commands_active());
+        return 0;
+    }
+    if (!prefetched && !ar_prefill_fill(set,offsets,sizes)) return 0;
+    uint64_t total=0;
+    for (unsigned i=0;i<3;i++) {
+        ar_prefill_views[i]=(ar_prefill_view){ar_prefill_pool[set][i],map,size,offsets[i],sizes[i]};
+        total+=sizes[i];
+    }
+    ar_prefill_published_set=set;
+    uint64_t after[3]; ar_expert_bytes_snapshot(after);
+    fprintf(stderr,"ds4: Argodrive prefill staged bytes=%llu source_bytes=%llu,%llu,%llu ms=%.3f%s\n",
+        (unsigned long long)total,(unsigned long long)(after[0]-before[0]),
+        (unsigned long long)(after[1]-before[1]),(unsigned long long)(after[2]-before[2]),
+        ds4_gpu_now_ms()-t0,prefetched?" ahead":"");
+    return 1;
+}
+int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]) {
+    /* Best effort: a refusal here only costs the overlap, never correctness. The
+     * set filled is the one the GPU finished with at the last stage's synchronize. */
+    if (!ar_prefill_ahead_enabled() || ar_ahead_running) return 0;
+    if (!ar_prefill_ranges_valid(map,size,offsets,sizes,0)) return 0;
+    ar_ahead_set=ar_prefill_published_set^1u;
+    memcpy(ar_ahead_off,offsets,sizeof ar_ahead_off);
+    memcpy(ar_ahead_len,sizes,sizeof ar_ahead_len);
+    ar_ahead_ok=0;
+    if (pthread_create(&ar_ahead_thread,NULL,ar_prefill_ahead_main,NULL)!=0) return 0;
+    ar_ahead_running=1;
+    return 1;
+}
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
@@ -12835,6 +13153,8 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         return nil;
     }
 
+    id<MTLBuffer> staged=ar_prefill_lookup(model_map,model_size,offset,len,inner_offset);
+    if (staged) return staged;
     const uint64_t end = offset + len;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         if (g_model_views[i].model_map != model_map ||
@@ -12869,6 +13189,8 @@ static id<MTLBuffer> ds4_gpu_wrap_model_exact_range_impl(
         uint64_t    len,
         uint64_t   *inner_offset,
         ds4_gpu_exact_view_lifetime lifetime) {
+    id<MTLBuffer> staged=ar_prefill_lookup(model_map,model_size,offset,len,inner_offset);
+    if (staged) return staged;
     const bool cache_view = lifetime == DS4_GPU_EXACT_VIEW_CACHED;
     const bool transient_view = lifetime == DS4_GPU_EXACT_VIEW_TRANSIENT;
     if (!model_map || !g_device ||
@@ -16477,6 +16799,29 @@ static int ds4_gpu_stream_expert_pending_load_matches(
         if (p->selected_ids[i] != selected_ids[i]) return 0;
     }
     return 1;
+}
+
+/* Protect one layer's resident experts from being reused while its GPU work is
+ * still encoded but not complete. The demand path never needs this — the next
+ * allocation happens after a drain — but a speculative load for the NEXT layer is
+ * issued while this layer's MoE is in flight, and take_reusable_batch() protects
+ * only the selection it is given. Without this the speculative load can recycle the
+ * buffers the running layer is reading, which silently corrupts the output. */
+int ds4_gpu_stream_expert_cache_protect_layer(const void *model_map,
+                                              uint64_t model_size,
+                                              uint32_t layer,
+                                              const int32_t *ids,
+                                              uint32_t n_ids) {
+    if (!g_ssd_streaming_mode || !model_map || !ids ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 0;
+    uint32_t marked = 0;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][(uint32_t)ids[i]];
+        if (e->valid && e->model_map == model_map && e->model_size == model_size &&
+            ds4_gpu_stream_expert_cache_mark_inflight(e)) marked++;
+    }
+    return (int)marked;
 }
 
 int ds4_gpu_stream_expert_cache_begin_selected_load(

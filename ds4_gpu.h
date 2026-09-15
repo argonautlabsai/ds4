@@ -41,6 +41,16 @@ typedef struct {
 } ds4_gpu_attention_decode_row;
 #endif
 
+/* Experimental bounded V4.1 routed-tensor staging. Caller owns phase boundaries. */
+#ifdef __APPLE__
+int ar_prefill_stage(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]);
+int ar_prefill_clear(void);
+int ar_prefill_stage_ids(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         const int32_t *ids, uint32_t n_ids);
+int ar_prefill_release(void);
+int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]);
+#endif
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
@@ -383,6 +393,8 @@ int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+int ds4_gpu_stream_expert_cache_protect_layer(const void *model_map, uint64_t model_size,
+                                              uint32_t layer, const int32_t *ids, uint32_t n_ids);
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
