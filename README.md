@@ -13,8 +13,8 @@ The beta provides live drive charts and saved-run comparison. Install it, open L
 ## Build and reproduce
 
 ```sh
-git clone --branch argonaut-v41-benchmark https://github.com/argonautlabsai/ds4.git
-cd ds4
+git clone --branch argonaut-v41-benchmark https://github.com/argonautlabsai/ds4-argodrive.git
+cd ds4-argodrive
 # Match the recorded compiler/SDK; do not rely on an older selected CLT.
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
